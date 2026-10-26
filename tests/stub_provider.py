@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Test double for the OpenRouter chat-completions endpoint.
+"""Test double for the OpenRouter / Groq chat-completions endpoints.
 
 Used only by the end-to-end UI test. It mimics the wire format closely enough
 to exercise the real parser, scoring and highlighting code paths without
 spending API credits. Never imported by the application.
+
+Set ``STUB_RATE_LIMITED`` to a comma-separated list of model IDs to make those
+models answer HTTP 429, which exercises automatic model fallback.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 
 from flask import Flask, jsonify, request
@@ -16,6 +20,9 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 SPLIT = re.compile(r'(?<=[.!?])\s+')
+RATE_LIMITED = {
+    m.strip() for m in os.environ.get("STUB_RATE_LIMITED", "").split(",") if m.strip()
+}
 
 
 def classify(sentence: str) -> str:
@@ -28,8 +35,6 @@ def classify(sentence: str) -> str:
     ):
         return "AI"
     if any(marker in lowered for marker in ("i tried", "we fixed", "colleague", "tuesday", "i only")):
-        return "HUMAN"
-    if len(sentence.split()) < 6:
         return "HUMAN"
     return "HUMAN"
 
@@ -73,6 +78,12 @@ def models():
 @app.post("/v1/chat/completions")
 def completions():
     body = request.get_json(force=True, silent=True) or {}
+    if body.get("model") in RATE_LIMITED:
+        return (
+            jsonify({"error": {"message": "Rate limit exceeded (stub)", "code": 429}}),
+            429,
+            {"Retry-After": "30"},
+        )
     messages = body.get("messages") or []
     user = ""
     for message in messages:
@@ -81,17 +92,23 @@ def completions():
 
     match = re.search(r"===DATA START===\s*(.*?)\s*===DATA END===", user, re.DOTALL)
     data = match.group(1) if match else user
+    compact = '"labels"' in (messages[0].get("content") or "")
 
-    sentences = [s.strip() for s in SPLIT.split(re.sub(r"\s+", " ", data)) if s.strip()]
-    payload = {
-        "sentences": [
-            {"text": sentence, "classification": classify(sentence)}
-            for sentence in sentences
-        ]
-    }
+    if compact:
+        sentences = [re.sub(r"^\d+\.\s*", "", line) for line in data.splitlines() if line.strip()]
+        payload = {"labels": [classify(sentence) for sentence in sentences]}
+    else:
+        sentences = [s.strip() for s in SPLIT.split(re.sub(r"\s+", " ", data)) if s.strip()]
+        payload = {
+            "sentences": [
+                {"text": sentence, "classification": classify(sentence)}
+                for sentence in sentences
+            ]
+        }
 
     # Deliberately fenced: the production parser must strip it.
-    content = "```json\n" + json.dumps(payload, indent=2) + "\n```"
+    content = "```json\n" + json.dumps(payload) + "\n```"
+    prompt_tokens = sum(len(m.get("content") or "") for m in messages) // 4
 
     return jsonify(
         {
@@ -104,7 +121,7 @@ def completions():
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(content) // 4},
         }
     )
 

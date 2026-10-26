@@ -3,298 +3,377 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Glitch//Detect — AI Writing Forensics</title>
-<meta name="description" content="Local-first AI writing detection with sentence-level forensic highlighting.">
+<title>Glitch//Detect — AI Writing Checker</title>
+<meta name="description" content="Check whether text was written by AI, sentence by sentence.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230D0D11'/%3E%3Cpath d='M6 8h8v4H6zm12 0h8v4h-8zM6 14h20v4H6zm0 6h8v4H6zm12 0h8v4h-8z' fill='%2322D3EE'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;900&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body>
 <div class="bg-grid" aria-hidden="true"></div>
-<div class="bg-aurora" aria-hidden="true"></div>
-<div class="scanlines" aria-hidden="true"></div>
 
-<header class="topbar">
-  <div class="brand">
-    <div class="brand-mark" aria-hidden="true">
-      <span></span><span></span><span></span><span></span>
+<!-- Provider metadata for the script; nothing here is displayed. -->
+<div id="providerData" hidden>
+  {% for key, p in providers.items() %}
+  <span data-provider="{{ key }}" data-label="{{ p.label }}"
+        data-default-model="{{ p.default_model }}" data-keys-url="{{ p.keys_url }}"
+        data-placeholder="{{ p.key_placeholder }}" data-ready="{{ '1' if p.env_key else '' }}"></span>
+  {% endfor %}
+</div>
+
+<div class="shell">
+  <!-- ───────────────────────── sidebar ───────────────────────── -->
+  <aside class="sidebar" aria-label="Main">
+    <a class="sb-brand" href="#check" aria-label="Glitch//Detect home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span class="glitch" data-text="GLITCH//DETECT">GLITCH//DETECT</span>
+    </a>
+
+    <nav class="sb-nav">
+      <a class="sb-link" href="#check" data-view="check">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/><path d="M8.5 11h5"/></svg>
+        <span>Check text</span>
+      </a>
+      <a class="sb-link" href="#humanize" data-view="humanize">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></svg>
+        <span>Humanize</span>
+        <span class="soon-tag">SOON</span>
+      </a>
+      <a class="sb-link" href="#settings" data-view="settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+        <span>Settings</span>
+        <span class="sb-alert" id="setupDot" hidden aria-label="Setup needed"></span>
+      </a>
+      <a class="sb-link" href="#account" data-view="account">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c1.2-3.6 3.8-5.5 7-5.5s5.8 1.9 7 5.5"/></svg>
+        <span>Account</span>
+      </a>
+    </nav>
+
+    <div class="sb-foot" id="nodeStatus" data-state="pending">
+      <span class="pulse"></span>
+      <span id="nodeLabel">Connecting…</span>
     </div>
-    <div>
-      <h1 class="glitch" data-text="GLITCH//DETECT">GLITCH//DETECT</h1>
-      <p class="tagline">SENTENCE-LEVEL WRITING FORENSICS <span class="sep">/</span> NODE 01</p>
-    </div>
-  </div>
-  <div class="node-status" id="nodeStatus" data-state="pending">
-    <span class="pulse"></span>
-    <span id="nodeLabel">LINKING…</span>
-    <span class="node-divider"></span>
-    <span class="mono" id="engineLabel">{{ default_model }}</span>
-  </div>
-</header>
-
-<main class="layout">
-  <!-- ───────────────────────── config rail ───────────────────────── -->
-  <aside class="rail">
-    <section class="panel config-panel">
-      <div class="panel-head">
-        <h2><span class="slash">//</span> CONFIG</h2>
-        <span class="badge" id="keyBadge" data-state="empty">NO KEY</span>
-      </div>
-
-      <div class="provider-switch" role="group" aria-label="Model provider">
-        {% for key, p in providers.items() %}
-        <button class="provider-btn{% if key == default_provider %} active{% endif %}"
-                type="button" data-provider="{{ key }}"
-                data-key-label="{{ p.key_label }}"
-                data-key-placeholder="{{ p.key_placeholder }}"
-                data-keys-url="{{ p.keys_url }}"
-                data-default-model="{{ p.default_model }}"
-                data-provider-label="{{ p.label }}"
-                aria-pressed="{{ 'true' if key == default_provider else 'false' }}">
-          {{ p.label|upper }}
-        </button>
-        {% endfor %}
-      </div>
-      <p class="provider-note" id="providerNote">LIVE TRANSPORT · FREE MODELS ONLY</p>
-
-      <label class="field-label" for="apiKey" id="keyLabel">OPENROUTER API KEY</label>
-      <div class="key-row">
-        <input id="apiKey" type="password" spellcheck="false" autocomplete="off"
-               placeholder="sk-or-v1-…" aria-describedby="keyHint">
-        <button id="toggleKey" class="mini-btn" type="button" aria-label="Show API key">SHOW</button>
-      </div>
-      <p class="hint" id="keyHint">
-        Held in memory. Enable session retention below to keep it across reloads. Never logged.
-        <a id="keysLink" href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">Get a key ↗</a>
-      </p>
-
-      <label class="check-row" for="rememberKey">
-        <input id="rememberKey" type="checkbox">
-        <span>Keep in this tab (sessionStorage)</span>
-      </label>
-
-      <label class="field-label" for="model">FREE MODEL <span class="free-tag" id="freeTag">FREE ONLY</span></label>
-      <div class="model-row">
-        <input id="model" type="text" list="modelList" spellcheck="false" value="{{ default_model }}" autocomplete="off">
-        <button id="refreshModels" class="mini-btn" type="button" aria-label="Refresh free model list">⟳</button>
-      </div>
-      <datalist id="modelList">
-        <option value="{{ default_model }}"></option>
-      </datalist>
-      <p class="hint" id="modelHint">Only free models · ranked for this task.</p>
-
-      <details class="advanced">
-        <summary><span class="slash">//</span> ENGINE OPTIONS</summary>
-        <label class="field-label" for="chunkWords">WORDS PER API CHUNK</label>
-        <input id="chunkWords" type="number" min="200" max="1800" step="50" value="900">
-        <p class="hint">Long documents are split on paragraph boundaries. Smaller chunks use more calls.</p>
-      </details>
-    </section>
-
-    <section class="panel legend-panel" aria-labelledby="legendTitle">
-      <div class="panel-head">
-        <h2 id="legendTitle"><span class="slash">//</span> LEGEND</h2>
-        <span class="mono tiny">SIGNAL KEY</span>
-      </div>
-
-      <article class="legend-item" data-tone="ai">
-        <span class="legend-swatch" aria-hidden="true"></span>
-        <div>
-          <h3>AI GENERATED <span class="legend-code">#EF4444</span></h3>
-          <p>High predictability, flat rhythm, low burstiness. Machine-authored text.</p>
-        </div>
-      </article>
-
-      <article class="legend-item" data-tone="refined">
-        <span class="legend-swatch" aria-hidden="true"></span>
-        <div>
-          <h3>AI REFINED <span class="legend-code">#F59E0B</span></h3>
-          <p>Paraphrased, polished, or rewritten over an AI base. Machine structure with a human surface.</p>
-        </div>
-      </article>
-
-      <article class="legend-item" data-tone="human">
-        <span class="legend-swatch" aria-hidden="true"></span>
-        <div>
-          <h3>HUMAN <span class="legend-code">#3B82F6</span></h3>
-          <p>Natural variance, idiom, irregular rhythm, stylistic imperfection.</p>
-        </div>
-      </article>
-
-      <div class="formula">
-        <span class="formula-label">SCORE</span>
-        <code>(AI + REFINED) / TOTAL × 100</code>
-      </div>
-    </section>
   </aside>
 
-  <!-- ───────────────────────── workspace ───────────────────────── -->
-  <section class="workspace">
-    <section class="panel editor-panel" id="editorPanel">
-      <div class="panel-head">
-        <h2><span class="slash">//</span> INPUT STREAM</h2>
-        <span class="mono tiny" id="textStats">0 WORDS · 0 CHARS</span>
-      </div>
+  <main class="main">
+    <!-- ───────────────────────── check text ───────────────────────── -->
+    <section class="view" id="view-check" data-view="check">
+      <header class="page-head">
+        <p class="eyebrow" id="greeting">AI writing checker</p>
+        <h1>Is this written by AI?</h1>
+        <p class="page-sub">Paste any text and we'll highlight which sentences look AI-written.</p>
+      </header>
 
-      <div class="textarea-shell">
-        <textarea id="text" spellcheck="false" maxlength="{{ max_chars }}" aria-label="Text to analyze"
-          placeholder="Paste the text you want to interrogate. The engine reads every sentence for perplexity, burstiness and machine-standard phrasing. Up to {{ '{:,}'.format(max_chars) }} characters; longer documents are chunked automatically."></textarea>
-        <div class="corner tl" aria-hidden="true"></div>
-        <div class="corner tr" aria-hidden="true"></div>
-        <div class="corner bl" aria-hidden="true"></div>
-        <div class="corner br" aria-hidden="true"></div>
-        <div class="scan-sweep" aria-hidden="true"></div>
-      </div>
-
-      <div class="editor-actions">
-        <button id="analyzeBtn" class="btn-glitch" type="button">
-          <span class="btn-label">RUN FORENSIC SCAN</span>
-          <span class="btn-loading"><i></i> SCANNING<span id="dots">…</span></span>
-        </button>
-        <button id="sampleBtn" class="btn-ghost" type="button">LOAD SAMPLE</button>
-        <button id="clearBtn" class="btn-ghost" type="button">CLEAR</button>
-        <span class="kbd-hint"><kbd>Ctrl</kbd> + <kbd>↵</kbd></span>
-        <span class="elapsed mono" id="elapsed" hidden>0.0s</span>
-      </div>
-
-      <p class="disclaimer">
-        Probabilistic estimate, not proof. False positives concentrate on non-native English,
-        formulaic genres, and heavily edited drafts. Never use a score as the sole basis for
-        an accusation.
-      </p>
-    </section>
-
-    <div class="alert" id="alert" role="alert" hidden>
-      <div class="alert-head">
-        <span class="alert-icon" aria-hidden="true">!</span>
-        <div>
-          <strong id="alertTitle">REQUEST FAILED</strong>
-          <p id="alertMessage"></p>
+      <section class="panel editor-panel" id="editorPanel">
+        <div class="textarea-shell">
+          <textarea id="text" spellcheck="false" maxlength="{{ max_chars }}" aria-label="Text to check"
+            data-min-chars="{{ min_chars }}"
+            placeholder="Paste an essay, article, email… anything with at least a few sentences."></textarea>
+          <div class="scan-sweep" aria-hidden="true"></div>
         </div>
-        <button class="mini-btn" id="alertClose" type="button" aria-label="Dismiss">✕</button>
-      </div>
-      <details id="alertDetailWrap" hidden>
-        <summary>UPSTREAM DETAIL</summary>
-        <pre id="alertDetail"></pre>
-      </details>
-    </div>
 
-    <section id="results" class="results" hidden aria-live="polite">
-      <div class="panel scoreboard" id="scoreboard" data-level="low">
-        <div class="gauge-block">
+        <div class="editor-actions">
+          <button id="analyzeBtn" class="btn-primary" type="button">
+            <span class="btn-label">CHECK TEXT</span>
+            <span class="btn-loading"><i></i> CHECKING<span id="dots"></span></span>
+          </button>
+          <button id="sampleBtn" class="btn-ghost" type="button">Try an example</button>
+          <button id="clearBtn" class="btn-ghost" type="button">Clear</button>
+          <span class="text-stats" id="textStats">0 words</span>
+        </div>
+        <p class="progress-note" id="progressNote" hidden>Reading your text… longer pieces can take up to a minute.</p>
+      </section>
+
+      <div class="alert" id="alert" role="alert" hidden>
+        <div class="alert-head">
+          <span class="alert-icon" aria-hidden="true">!</span>
+          <div class="alert-body">
+            <strong id="alertTitle">Something went wrong</strong>
+            <p id="alertMessage"></p>
+            <a class="alert-action" id="alertAction" href="#settings" hidden>Open settings →</a>
+          </div>
+          <button class="mini-btn" id="alertClose" type="button" aria-label="Dismiss">✕</button>
+        </div>
+        <details id="alertDetailWrap" hidden>
+          <summary>Technical details</summary>
+          <pre id="alertDetail"></pre>
+        </details>
+      </div>
+
+      <section id="results" class="results" hidden aria-live="polite">
+        <div class="panel scoreboard" id="scoreboard" data-level="low">
           <div class="gauge">
             <svg viewBox="0 0 220 220" role="img" aria-labelledby="gaugeTitle">
-              <title id="gaugeTitle">AI probability score</title>
-              <defs>
-                <filter id="gaugeGlow" x="-60%" y="-60%" width="220%" height="220%">
-                  <feGaussianBlur stdDeviation="5" result="blur"/>
-                  <feMerge>
-                    <feMergeNode in="blur"/>
-                    <feMergeNode in="blur"/>
-                    <feMergeNode in="SourceGraphic"/>
-                  </feMerge>
-                </filter>
-              </defs>
+              <title id="gaugeTitle">How likely this text is AI-written</title>
               <circle class="gauge-track" cx="110" cy="110" r="88"/>
               <circle class="gauge-ticks" cx="110" cy="110" r="101"/>
               <circle class="gauge-arc" id="gaugeArc" cx="110" cy="110" r="88"
                       pathLength="100" transform="rotate(-90 110 110)"/>
-              <circle class="gauge-inner" cx="110" cy="110" r="68"/>
             </svg>
             <div class="gauge-center">
               <div class="gauge-number"><span id="scoreValue">0</span><span class="pct">%</span></div>
-              <div class="gauge-caption">AI PROBABILITY</div>
-            </div>
-          </div>
-          <div class="gauge-scale mono"><span>HUMAN</span><span>HYBRID</span><span>MACHINE</span></div>
-        </div>
-
-        <div class="score-meta">
-          <div class="verdict-line">
-            <span class="verdict-tag" id="verdictTag">ANALYSIS</span>
-            <span class="mono tiny" id="scanMeta">— SENTENCES · — MS</span>
-          </div>
-          <h2 class="verdict" id="verdict">AWAITING SIGNAL</h2>
-          <p class="verdict-note" id="verdictNote">
-            The score is the share of sentences classified AI or AI-refined.
-          </p>
-
-          <div class="stat-grid">
-            <div class="stat" data-tone="ai">
-              <span class="stat-label">AI</span>
-              <strong id="countAI">0</strong>
-              <span class="stat-sub">generated</span>
-            </div>
-            <div class="stat" data-tone="refined">
-              <span class="stat-label">REFINED</span>
-              <strong id="countRefined">0</strong>
-              <span class="stat-sub">paraphrased</span>
-            </div>
-            <div class="stat" data-tone="human">
-              <span class="stat-label">HUMAN</span>
-              <strong id="countHuman">0</strong>
-              <span class="stat-sub">organic</span>
-            </div>
-            <div class="stat" data-tone="total">
-              <span class="stat-label">TOTAL</span>
-              <strong id="countTotal">0</strong>
-              <span class="stat-sub">sentences</span>
+              <div class="gauge-caption">LIKELY AI</div>
             </div>
           </div>
 
-          <div class="warnings" id="warnings" hidden>
-            <span class="warn-icon" aria-hidden="true">⚠</span>
-            <ul id="warningList"></ul>
+          <div class="score-meta">
+            <h2 class="verdict" id="verdict">—</h2>
+            <p class="verdict-note" id="verdictNote"></p>
+
+            <div class="stat-grid">
+              <div class="stat" data-tone="ai">
+                <strong id="countAI">0</strong>
+                <span class="stat-label">Likely AI</span>
+              </div>
+              <div class="stat" data-tone="refined">
+                <strong id="countRefined">0</strong>
+                <span class="stat-label">AI-polished</span>
+              </div>
+              <div class="stat" data-tone="human">
+                <strong id="countHuman">0</strong>
+                <span class="stat-label">Human</span>
+              </div>
+            </div>
+
+            <p class="notice" id="notice" hidden></p>
           </div>
         </div>
-      </div>
 
-      <div class="panel doc-panel">
-        <div class="panel-head">
-          <h2><span class="slash">//</span> SENTENCE MAP</h2>
-          <div class="doc-tools">
-            <label class="switch" for="showTags">
-              <input type="checkbox" id="showTags">
-              <span class="switch-track"><span class="switch-thumb"></span></span>
-              <span class="switch-label">TAGS</span>
-            </label>
-            <button class="mini-btn" id="copyBtn" type="button">COPY JSON</button>
-            <button class="mini-btn" id="downloadBtn" type="button">EXPORT</button>
+        <div class="panel doc-panel">
+          <div class="panel-head">
+            <h2>Your text, highlighted</h2>
+            <div class="doc-tools">
+              <label class="switch" for="showTags">
+                <input type="checkbox" id="showTags">
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+                <span class="switch-label">Show labels</span>
+              </label>
+              <button class="mini-btn" id="humanizeFlagged" type="button" disabled
+                      title="Coming soon">Humanize flagged <span class="soon-tag">SOON</span></button>
+              <button class="mini-btn" id="downloadBtn" type="button">Download</button>
+            </div>
+          </div>
+          <div class="doc-legend">
+            <span><i class="dot ai"></i>Likely AI</span>
+            <span><i class="dot refined"></i>AI-polished</span>
+            <span><i class="dot human"></i>Human</span>
+          </div>
+          <div class="doc" id="doc"></div>
+        </div>
+      </section>
+
+      <section class="empty-state" id="emptyState">
+        <div class="steps">
+          <div class="step"><span class="step-n">1</span><p><strong>Paste</strong> the text you want to check.</p></div>
+          <div class="step"><span class="step-n">2</span><p><strong>Check</strong> — every sentence gets read.</p></div>
+          <div class="step"><span class="step-n">3</span><p><strong>Review</strong> the colour-coded result.</p></div>
+        </div>
+      </section>
+
+      <p class="disclaimer">
+        A score is a hint, not proof. Detectors can be wrong — especially with non-native English,
+        formulaic writing, or heavily edited drafts. Please don't accuse anyone based on a score alone.
+      </p>
+    </section>
+
+    <!-- ───────────────────────── humanize ───────────────────────── -->
+    <section class="view" id="view-humanize" data-view="humanize" hidden>
+      <header class="page-head">
+        <p class="eyebrow">Coming soon</p>
+        <h1>Humanize</h1>
+        <p class="page-sub">Rewrite AI-sounding sentences so they read naturally, in your own voice.</p>
+      </header>
+
+      <section class="panel humanize-panel">
+        <div class="humanize-grid">
+          <div>
+            <label class="field-label" for="humanizeInput">Original</label>
+            <textarea id="humanizeInput" class="humanize-box" spellcheck="false"
+              placeholder="Text to rewrite. You'll be able to send flagged sentences here straight from a check."></textarea>
+          </div>
+          <div>
+            <span class="field-label">Rewritten</span>
+            <div class="humanize-box humanize-output" aria-live="polite">
+              <span>Your rewritten text will appear here.</span>
+            </div>
           </div>
         </div>
-        <div class="doc" id="doc"></div>
-        <div class="doc-legend mono">
-          <span><i class="dot ai"></i>AI</span>
-          <span><i class="dot refined"></i>REFINED</span>
-          <span><i class="dot human"></i>HUMAN</span>
+        <div class="humanize-options">
+          <label class="field-label" for="humanizeTone">Tone</label>
+          <select id="humanizeTone" disabled>
+            <option>Natural</option>
+            <option>Casual</option>
+            <option>Academic</option>
+            <option>Professional</option>
+          </select>
         </div>
-      </div>
+        <div class="editor-actions">
+          <button class="btn-primary" type="button" disabled>REWRITE</button>
+          <span class="soon-note">We're still building this. Stay tuned!</span>
+        </div>
+      </section>
+    </section>
 
-      <details class="panel raw-panel">
-        <summary><span class="slash">//</span> RAW RESPONSE OBJECT</summary>
-        <pre id="rawJson"></pre>
+    <!-- ───────────────────────── settings ───────────────────────── -->
+    <section class="view" id="view-settings" data-view="settings" hidden>
+      <header class="page-head">
+        <p class="eyebrow">Settings</p>
+        <h1>Configuration</h1>
+        <p class="page-sub">Changes save automatically.</p>
+      </header>
+
+      <section class="panel settings-card">
+        <h2>AI service</h2>
+        <p class="card-sub">The free service that reads your text. Both work well.</p>
+        <div class="choice-grid" role="radiogroup" aria-label="AI service">
+          {% for key, p in providers.items() %}
+          <button class="choice" type="button" role="radio" aria-checked="false" data-provider-choice="{{ key }}">
+            <span class="choice-title">{{ p.label }}</span>
+            <span class="choice-desc">{{ 'Wide choice of free models.' if key == 'openrouter' else 'Very fast responses.' }}</span>
+            <span class="choice-status" data-status="{{ key }}"></span>
+          </button>
+          {% endfor %}
+        </div>
+
+        <label class="field-label" for="model">Model</label>
+        <div class="model-row">
+          <select id="model" aria-describedby="modelHint">
+            <option value="{{ default_model }}">{{ default_model }}</option>
+          </select>
+          <button id="refreshModels" class="mini-btn" type="button" aria-label="Refresh model list" title="Refresh list">⟳</button>
+        </div>
+        <p class="hint" id="modelHint">All models listed here are free to use. The first one is our recommendation.</p>
+      </section>
+
+      <section class="panel settings-card">
+        <h2>When the service is busy</h2>
+        <p class="card-sub">Free services sometimes limit how often you can use them.</p>
+        <label class="toggle-row" for="optFallback">
+          <span>
+            <strong>Automatically try another model</strong>
+            <small>Keeps your check going instead of stopping with an error.</small>
+          </span>
+          <span class="switch"><input type="checkbox" id="optFallback" checked><span class="switch-track"><span class="switch-thumb"></span></span></span>
+        </label>
+        <label class="toggle-row" for="optCrossProvider">
+          <span>
+            <strong>Allow switching to the other service</strong>
+            <small>Only used when both services are set up.</small>
+          </span>
+          <span class="switch"><input type="checkbox" id="optCrossProvider" checked><span class="switch-track"><span class="switch-thumb"></span></span></span>
+        </label>
+      </section>
+
+      <section class="panel settings-card">
+        <h2>Your own API keys <span class="optional">optional</span></h2>
+        <p class="card-sub">
+          Glitch//Detect works out of the box when a key is already set up. Add your own key
+          if you'd rather use your personal account.
+        </p>
+
+        {% for key, p in providers.items() %}
+        <div class="key-card" data-provider="{{ key }}">
+          <div class="key-card-head">
+            <label class="key-card-title" for="key-{{ key }}">{{ p.label }}</label>
+            <a href="{{ p.keys_url }}" target="_blank" rel="noopener noreferrer">Get a free key ↗</a>
+          </div>
+          <div class="key-row">
+            <input id="key-{{ key }}" type="password" spellcheck="false" autocomplete="off"
+                   data-key-input="{{ key }}" placeholder="Paste your {{ p.label }} key">
+            <button class="mini-btn" type="button" data-key-toggle="{{ key }}" aria-label="Show {{ p.label }} key">Show</button>
+            <button class="mini-btn" type="button" data-key-clear="{{ key }}" aria-label="Remove {{ p.label }} key">Remove</button>
+          </div>
+        </div>
+        {% endfor %}
+
+        <label class="toggle-row" for="rememberKeys">
+          <span>
+            <strong>Remember my keys until I close this tab</strong>
+            <small>Keys are never saved permanently.</small>
+          </span>
+          <span class="switch"><input type="checkbox" id="rememberKeys"><span class="switch-track"><span class="switch-thumb"></span></span></span>
+        </label>
+      </section>
+
+      <details class="panel settings-card advanced">
+        <summary><h2>Advanced</h2><span class="card-sub">Speed and usage options</span></summary>
+        <div class="settings-grid">
+          <div>
+            <label class="field-label" for="concurrency">Speed</label>
+            <select id="concurrency">
+              <option value="0">Balanced (recommended)</option>
+              <option value="1">Gentle — fewer "busy" errors</option>
+              <option value="4">Fast — more at once</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="chunkWords">Words per section</label>
+            <input id="chunkWords" type="number" min="200" max="1800" step="50" value="900">
+          </div>
+        </div>
+        <p class="hint">Long texts are read in sections. Bigger sections are more efficient; smaller ones are gentler on free limits.</p>
+        <label class="toggle-row" for="optCompact">
+          <span>
+            <strong>Quick mode</strong>
+            <small>Uses far less of your free allowance. Turn off only if results look off.</small>
+          </span>
+          <span class="switch"><input type="checkbox" id="optCompact" checked><span class="switch-track"><span class="switch-thumb"></span></span></span>
+        </label>
+        <label class="toggle-row" for="optBalance">
+          <span>
+            <strong>Share long documents across models</strong>
+            <small>Faster and fewer "busy" errors. Different parts may be judged by different models.</small>
+          </span>
+          <span class="switch"><input type="checkbox" id="optBalance" checked><span class="switch-track"><span class="switch-thumb"></span></span></span>
+        </label>
       </details>
     </section>
 
-    <section class="empty-state" id="emptyState">
-      <div class="glyph" aria-hidden="true">
-        <span></span><span></span><span></span><span></span><span></span>
-      </div>
-      <p class="empty-title">NO SIGNAL IN BUFFER</p>
-      <p class="empty-copy">Paste a passage and run the scan. Each sentence is classified and colour-coded.</p>
+    <!-- ───────────────────────── account ───────────────────────── -->
+    <section class="view" id="view-account" data-view="account" hidden>
+      <header class="page-head">
+        <p class="eyebrow">Account</p>
+        <h1>Your profile</h1>
+        <p class="page-sub">No sign-up needed. Everything stays on this computer.</p>
+      </header>
+
+      <section class="panel settings-card profile-card">
+        <div class="avatar" id="avatar" aria-hidden="true">?</div>
+        <div class="profile-body">
+          <label class="field-label" for="displayName">Your name</label>
+          <input id="displayName" type="text" maxlength="40" autocomplete="nickname" placeholder="What should we call you?">
+          <p class="hint">Only used to greet you.</p>
+        </div>
+      </section>
+
+      <section class="panel settings-card">
+        <h2>Your activity</h2>
+        <div class="usage-grid">
+          <div class="usage"><strong id="statScans">0</strong><span>checks run</span></div>
+          <div class="usage"><strong id="statWords">0</strong><span>words checked</span></div>
+          <div class="usage"><strong id="statLast">—</strong><span>last check</span></div>
+        </div>
+      </section>
+
+      <section class="panel settings-card">
+        <h2>Sign in &amp; sync <span class="soon-tag">SOON</span></h2>
+        <p class="card-sub">Save your history and settings across devices.</p>
+        <button class="btn-ghost" type="button" disabled>Sign in</button>
+      </section>
+
+      <section class="panel settings-card">
+        <h2>Privacy</h2>
+        <p class="card-sub">Your text is only sent to the AI service you chose, and only when you press Check.</p>
+        <button class="btn-ghost danger" id="clearData" type="button">Clear my data on this device</button>
+      </section>
     </section>
-  </section>
-</main>
 
-<footer class="footer">
-  <span class="mono">GLITCH//DETECT v1.0</span>
-  <span class="footer-sep">·</span>
-  <span class="mono" id="footerTransport">LOCAL NODE / OPENROUTER TRANSPORT</span>
-  <span class="footer-sep">·</span>
-  <span class="mono">DETECTION IS EVIDENCE, NOT VERDICT</span>
-</footer>
-
-<script src="{{ url_for('static', filename='app.js') }}"></script>
+    <footer class="footer">GLITCH//DETECT · Detection is evidence, not a verdict.</footer>
+  </main>
+</div>
 </body>
 </html>
