@@ -1,14 +1,17 @@
 # Admin dashboard — brief for the implementing agent
 
 You are building the admin dashboard for **Glitch//Detect**, a local-first
-AI-writing detector and humanizer (Flask + vanilla JS, no build step). The
+AI-writing detector and humanizer (FastAPI backend + static vanilla-JS
+frontend, no build step). The
 backend for key management already exists and is tested; your job is mainly
 the UI, plus any small backend additions listed under *Optional extensions*.
 
 Read this file fully before writing code. Then skim, in this order:
-`glitch/web.py` (routes), `glitch/keys.py` (key store), `glitch/providers.py`
-(provider registry), `templates/index.html` + `static/app.js` (the user app you
-are matching), and `tests/test_glitch.py` (`AdminApiTests`, `KeyStoreTests`).
+`backend/glitch/api.py` (routes), `backend/glitch/keys.py` (key store),
+`backend/glitch/providers.py` (provider registry), `frontend/index.html` +
+`frontend/static/app.js` (the user app you are matching), and
+`backend/tests/test_glitch.py` (`AdminApiTests`, `KeyStoreTests`). The live
+API schema is at `/docs` while the app runs.
 
 ---
 
@@ -129,7 +132,7 @@ Ask for confirmation before deleting ("Remove the Gemini key ending QQQQ?").
 | `POST /api/keys/identify` `{key}` | Recognise a key **without storing it** → `{provider, label, verified}`. Useful for a live "This looks like a Groq key" preview before saving. Note it also calls the provider to verify, so debounce it (≥600 ms) or call it only on blur/submit. |
 | `POST /api/models` `{provider}` | Model list for a provider using the server key. Good for a "Test key / show models" detail view. |
 
-Supported providers and key formats live in `glitch/providers.py`
+Supported providers and key formats live in `backend/glitch/providers.py`
 (`ProviderSpec.key_patterns`). Do not hard-code them in JS — read labels and
 billing from `/api/providers`.
 
@@ -139,19 +142,22 @@ billing from `/api/providers`.
 
 These come from the existing security model. Breaking any of them is a bug.
 
-1. **Same Flask app, same origin.** Add the dashboard as a route in
-   `glitch/web.py` (suggested: `GET /admin` rendering `templates/admin.html`).
+1. **Same app, same origin.** Create `frontend/admin.html` — the backend
+   already serves any `frontend/<name>.html` at `/<name>`, so it appears at
+   `/admin` with no backend change.
    The server rejects requests whose `Host` isn't `127.0.0.1`/`localhost`, and
    there is no CORS — a separate dev server on another port will not work.
-2. **Content-Security-Policy** (`_CSP` in `glitch/web.py`) allows scripts and
+2. **Content-Security-Policy** (`_CSP` in `backend/glitch/api.py`) allows scripts and
    styles **only from `'self'`** (plus Google Fonts CSS). Therefore:
    no inline `<script>`, no `onclick=""` attributes, no `style=""` attributes,
-   no CDN libraries. Put JS in `static/admin.js`, CSS in `static/style.css`
-   (or `static/admin.css`). Setting `element.style.x` from JS is fine.
+   no CDN libraries. Put JS in `frontend/static/admin.js`, CSS in
+   `frontend/static/style.css` (or `frontend/static/admin.css`), and reference
+   them as `/static/…`. Setting `element.style.x` from JS is fine.
+   API writes must be sent as `application/json` (others get 415).
 3. **Never render a full key**, never log one, never store one in browser
    storage. The admin types a key once; clear the input after a successful add.
 4. **Escape everything** you put into the DOM. Use `textContent` /
-   `createElement`, as `static/app.js` does. Labels are admin-supplied text.
+   `createElement`, as `frontend/static/app.js` does. Labels are admin-supplied text.
 5. **Don't weaken the admin gate**: keep the 404-when-disabled and 401
    behaviour, and don't add "remember me" persistence for the token.
 6. Don't change provider rules, prompts, or the free/paid fallback policy as
@@ -162,7 +168,7 @@ These come from the existing security model. Breaking any of them is a bug.
 ## 4. Look and feel
 
 Match the user app exactly — same dark cyber aesthetic, plain-language copy.
-Reuse `static/style.css`; don't fork the design.
+Reuse `frontend/static/style.css`; don't fork the design.
 
 - **Layout:** the user app is a `.shell` grid with a left `.sidebar`
   (`.sb-brand`, `.sb-nav` of `.sb-link`, `.sb-foot` status) and `.main` holding
@@ -177,7 +183,7 @@ Reuse `static/style.css`; don't fork the design.
   `.mini-btn`) already exists for the user's own keys — extend it.
 - **Status:** `.choice-status[data-state="ready"|"needs-key"]`, `.badge`,
   `.soon-tag`; errors use the `.alert` block (see markup in
-  `templates/index.html`; the JS helper `showAlert(box, …)` in `app.js` shows
+  `frontend/index.html`; the JS helper `showAlert(box, …)` in `app.js` shows
   how it's driven).
 - **Tokens** (`:root` in `style.css`): `--cyan` accent, `--red/--amber/--blue`
   plus `*-text` tints for readable coloured text, `--green` for success.
@@ -213,14 +219,16 @@ Reuse `static/style.css`; don't fork the design.
 
 ## 6. Optional extensions (backend work required)
 
-Not implemented. If you build any, add the route in `glitch/web.py` behind
-`@_admin_only`, keep the error envelope, and add tests.
+Not implemented. If you build any, add the route in `backend/glitch/api.py`
+with `dependencies=admin` (the `require_admin` dependency), use a pydantic
+request model, raise `DetectorError` for failures so the error envelope is
+kept, and add tests.
 
 | Feature | Notes |
 |---|---|
 | Edit label | `PATCH /api/admin/keys/<id> {label}` → add `KeyStore.relabel()`. |
 | Re-verify a key | `POST /api/admin/keys/<id>/verify` → `keys.probe(key, provider)`; update `verified`. |
-| Usage stats | No counters exist. `analyze`/`humanize` results carry `usage.total_tokens`, `models_used`, `fallbacks`; aggregate them in memory in `web.py` (per provider, per day) and expose `GET /api/admin/stats`. Do not persist user text. |
+| Usage stats | No counters exist. `analyze`/`humanize` results carry `usage.total_tokens`, `models_used`, `fallbacks`; aggregate them in memory in `api.py` (per provider, per day) and expose `GET /api/admin/stats`. Do not persist user text. |
 | Key priority | Let the admin choose which key is active per provider (store an `order` field). |
 | Multiple keys per provider rotation | Would need routing changes (`keys.resolve_request_keys`, `routing.run_job`); discuss before building. |
 
@@ -229,9 +237,10 @@ Not implemented. If you build any, add the route in `glitch/web.py` behind
 ## 7. Working in this repo
 
 ```bash
-./run.sh                                         # serve on http://127.0.0.1:8501
-.venv/bin/python -m unittest discover -s tests   # all tests (offline, ~0.3 s)
-node --check static/admin.js                     # JS syntax check
+./run.sh                                                  # serve on http://127.0.0.1:8501
+.venv/bin/python -m pip install -r backend/requirements-dev.txt   # once, for tests
+.venv/bin/python -m unittest discover -s backend/tests    # all tests (offline, <1 s)
+node --check frontend/static/admin.js                     # JS syntax check
 ```
 
 Enable the admin API locally: add `ADMIN_TOKEN=some-long-random-string` to
@@ -240,11 +249,11 @@ Enable the admin API locally: add `ADMIN_TOKEN=some-long-random-string` to
 Test without real keys or network — run the stub and point providers at it:
 
 ```bash
-.venv/bin/python tests/stub_provider.py          # terminal 1: fake provider on :8599
+.venv/bin/python backend/tests/stub_provider.py  # terminal 1: fake provider on :8599
 S=http://127.0.0.1:8599/v1
 PORT=8611 OPENROUTER_BASE_URL=$S GROQ_BASE_URL=$S GEMINI_BASE_URL=$S \
   ADMIN_TOKEN=test-admin GLITCH_INSTANCE_DIR=/tmp/glitch-instance \
-  .venv/bin/python app.py                        # terminal 2
+  .venv/bin/python backend/main.py               # terminal 2
 ```
 
 With that setup any well-formed key (e.g. `AIza` + 35 letters) verifies
@@ -256,7 +265,7 @@ Conventions:
   modules and non-obvious functions, comments only where intent isn't obvious.
 - JS: one IIFE per page, `"use strict"`, an `els` map of elements, a `state`
   object, small named functions, no frameworks, no build step. Model it on
-  `static/app.js` and reuse its patterns (`store` wrapper with try/catch,
+  `frontend/static/app.js` and reuse its patterns (`store` wrapper with try/catch,
   `postJson`, `showAlert`).
 - Tests: the test module blocks all network access and swaps `keys.store` for a
   temp store — follow `AdminApiTests` for new admin tests. Mock `keys.probe`

@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from fastapi.testclient import TestClient
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from glitch import analyzer, cache, catalogue, client, config, create_app, keys, routing  # noqa: E402
@@ -57,6 +59,11 @@ def setUpModule():
 def tearDownModule():
     for patch in reversed(_env_patches):
         patch.stop()
+
+
+def make_client() -> TestClient:
+    """A TestClient that looks local, so the real host guard stays active."""
+    return TestClient(create_app(), base_url="http://127.0.0.1:8501")
 
 
 def reset_state():
@@ -492,13 +499,12 @@ class ConfigTests(unittest.TestCase):
 class WebTests(unittest.TestCase):
     def setUp(self):
         reset_state()
-        self.app = create_app()
-        self.client = self.app.test_client()
+        self.client = make_client()
 
     def test_env_key_flag_never_leaks_key(self):
         with mock.patch.dict(os.environ, {"GROQ_API_KEY": "gsk-secret-value-123"}):
-            body = self.client.get("/api/health").get_data(as_text=True)
-            page = self.client.get("/").get_data(as_text=True)
+            body = self.client.get("/api/health").text
+            page = self.client.get("/").text
         self.assertNotIn("gsk-secret-value-123", body + page)
         providers = {p["id"]: p for p in json.loads(body)["providers"]}
         self.assertTrue(providers["groq"]["ready"])
@@ -521,14 +527,14 @@ class WebTests(unittest.TestCase):
             response = self.client.post("/api/analyze", json={
                 "text": GOOD_TEXT, "model": "test/model:free", "fallback": False,
             })
-        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.status_code, 200, response.json())
         self.assertEqual(seen["key"], "sk-or-env-key-9999")
 
     def test_missing_key_points_to_settings(self):
         with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}):
             response = self.client.post("/api/analyze", json={"text": GOOD_TEXT})
         self.assertEqual(response.status_code, 400)
-        self.assertIn("Settings", response.get_json()["error"]["message"])
+        self.assertIn("Settings", response.json()["error"]["message"])
 
     def test_word_limit(self):
         long_text = "word " * (config.MAX_WORDS + 1)
@@ -536,11 +542,11 @@ class WebTests(unittest.TestCase):
             with self.subTest(route=route):
                 response = self.client.post(route, json={"text": long_text})
                 self.assertEqual(response.status_code, 413)
-                self.assertIn("2,500 words", response.get_json()["error"]["message"])
+                self.assertIn("2,500 words", response.json()["error"]["message"])
 
     def test_providers_endpoint_lists_readiness_without_keys(self):
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "AIza" + "x" * 35}):
-            data = self.client.get("/api/providers").get_json()
+            data = self.client.get("/api/providers").json()
         providers = {p["id"]: p for p in data["providers"]}
         self.assertTrue(providers["gemini"]["ready"])
         self.assertNotIn("AIza", json.dumps(data))
@@ -888,8 +894,7 @@ class AdminApiTests(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        self.app = create_app()
-        self.client = self.app.test_client()
+        self.client = make_client()
 
     def test_disabled_without_token(self):
         with mock.patch.object(config, "ADMIN_TOKEN", ""):
@@ -905,18 +910,18 @@ class AdminApiTests(unittest.TestCase):
             )
             added = self.client.post("/api/admin/keys", json={"key": SAMPLE_KEYS["gemini"]}, headers=auth)
             self.assertEqual(added.status_code, 201)
-            entry = added.get_json()["key"]
+            entry = added.json()["key"]
             self.assertEqual(entry["provider"], "gemini")  # recognised, not specified
-            listed = self.client.get("/api/admin/keys", headers=auth).get_json()
+            listed = self.client.get("/api/admin/keys", headers=auth).json()
             self.assertNotIn(SAMPLE_KEYS["gemini"], json.dumps(listed))
-            ready = {p["id"] for p in self.client.get("/api/providers").get_json()["providers"] if p["ready"]}
+            ready = {p["id"] for p in self.client.get("/api/providers").json()["providers"] if p["ready"]}
             self.assertIn("gemini", ready)
             gone = self.client.delete(f"/api/admin/keys/{entry['id']}", headers=auth)
             self.assertEqual(gone.status_code, 200)
 
     def test_identify_endpoint_does_not_store(self):
         response = self.client.post("/api/keys/identify", json={"key": SAMPLE_KEYS["cerebras"]})
-        self.assertEqual(response.get_json()["provider"], "cerebras")
+        self.assertEqual(response.json()["provider"], "cerebras")
         self.assertEqual(keys.store.ready_providers(), set())
 
 
@@ -1088,14 +1093,13 @@ class HumanizeTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
 
     def test_endpoint(self):
-        app = create_app()
         with mock.patch.object(client, "request_chunk", side_effect=self.fake):
-            response = app.test_client().post("/api/humanize", json={
+            response = make_client().post("/api/humanize", json={
                 "text": self.TEXT, "model": "test/model:free", "api_keys": {"openrouter": OR_KEY},
                 "labels": self.LABELS, "tone": "casual", "fallback": False, "fresh": True,
             })
-        self.assertEqual(response.status_code, 200, response.get_json())
-        result = response.get_json()["result"]
+        self.assertEqual(response.status_code, 200, response.json())
+        result = response.json()["result"]
         self.assertEqual(result["tone"], "casual")
         self.assertIn("tips", result)
 
@@ -1169,6 +1173,56 @@ class RoutingCostTests(unittest.TestCase):
             catalogue._entry("b/direct:free", "", 0, "recommended", ""),
         ]})
         self.assertEqual(catalogue.fallback_models("openrouter"), ["b/direct:free", "a/thinker:free"])
+
+
+class ApiLayerTests(unittest.TestCase):
+    def setUp(self):
+        self.client = make_client()
+
+    def test_config_for_static_frontend(self):
+        data = self.client.get("/api/config").json()
+        self.assertEqual(data["max_words"], config.MAX_WORDS)
+        self.assertIn("natural", data["tones"])
+        self.assertIn("personal", data["voices"])
+
+    def test_writes_must_be_json(self):
+        response = self.client.post("/api/analyze", content="text=hi",
+                                    headers={"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(response.status_code, 415)
+        self.assertFalse(response.json()["ok"])
+
+    def test_malformed_and_missing_bodies_use_the_error_envelope(self):
+        bad = self.client.post("/api/analyze", content="{not json", headers={"Content-Type": "application/json"})
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("message", bad.json()["error"])
+        empty = self.client.post("/api/analyze", headers={"Content-Type": "application/json"})
+        self.assertEqual(empty.status_code, 400)
+        self.assertIn("80+ characters", empty.json()["error"]["message"])
+
+    def test_lenient_fields(self):
+        with mock.patch.object(client, "request_chunk", return_value=json.dumps(GOOD)):
+            response = self.client.post("/api/analyze", json={
+                "text": GOOD_TEXT, "model": "test/model:free", "api_keys": {"openrouter": OR_KEY},
+                "chunk_words": "lots", "concurrency": None, "fallback": False, "extra": 1,
+            })
+        self.assertEqual(response.status_code, 200, response.json())
+
+    def test_pages_and_static_files(self):
+        self.assertEqual(self.client.get("/").status_code, 200)
+        self.assertIn("text/html", self.client.get("/").headers["content-type"])
+        self.assertEqual(self.client.get("/static/app.js").status_code, 200)
+        self.assertEqual(self.client.get("/admin").status_code, 404)  # until frontend/admin.html exists
+        self.assertEqual(self.client.get("/..%2Fbackend%2Fmain").status_code, 404)
+        self.assertEqual(self.client.get("/api/nope").json()["error"]["message"], "Not found.")
+
+    def test_security_headers_and_docs_policy(self):
+        app_csp = self.client.get("/").headers["content-security-policy"]
+        self.assertIn("script-src 'self';", app_csp)
+        self.assertNotIn("unsafe-inline", app_csp.split("style-src")[0])
+        docs = self.client.get("/docs")
+        self.assertEqual(docs.status_code, 200)
+        self.assertIn("cdn.jsdelivr.net", docs.headers["content-security-policy"])
+        self.assertEqual(self.client.get("/api/health").headers["x-frame-options"], "DENY")
 
 
 if __name__ == "__main__":

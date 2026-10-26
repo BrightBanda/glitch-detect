@@ -18,15 +18,60 @@ cp .env.example .env      # add at least one API key
 ./run.sh
 ```
 
-`run.sh` creates a virtualenv on first run, installs Flask + requests, and prints:
+`run.sh` creates a virtualenv on first run, installs the backend's requirements
+(FastAPI, uvicorn, requests) whenever they change, and prints:
 
 ```
-  LOCAL FORENSICS NODE  ·  multi-provider
+  LOCAL FORENSICS NODE  ·  multi-provider · FastAPI
   ➜  http://127.0.0.1:8501
+  API docs: http://127.0.0.1:8501/docs
   ready: Groq, OpenRouter
 ```
 
 Open the URL, paste text, press **CHECK TEXT**. Flagged sentences can be sent to
+**Humanize** with one click.
+
+### API keys — no provider needed
+
+Just add the key; the provider is recognised automatically.
+
+```
+# .env
+LLM_API_KEYS=gsk_…, AIza…, sk-or-v1-…
+```
+
+Provider-specific variables (`GROQ_API_KEY`, `GEMINI_API_KEY`, …) also work. In
+the app, **Settings → Your own API keys** takes any supported key the same way.
+See [Providers and keys](#providers-and-keys).
+
+Manual equivalent of `run.sh`:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python backend/main.py
+# or, with auto-reload while developing:
+.venv/bin/uvicorn main:app --app-dir backend --reload --port 8501
+```
+
+---
+
+## What it does
+
+**Check text**
+1. Splits the document into sentences (quick mode) or sections (classic mode).
+2. Looks every sentence up in the cache; only new or edited sentences are sent.
+3. Sends them in parallel through the shared router (balancing, fallback,
+   sized token budgets).
+4. Parses the reply tolerantly, scores `(AI + REFINED) / total × 100`, and
+   rebuilds the original text as colour-coded `<span>`s.
+
+| Class | Colour | Meaning |
+|---|---|---|
+| `AI` | `#EF4444` red | Machine-generated: high predictability, flat rhythm |
+| `REFINED` | `#F59E0B` amber | Paraphrased / polished over an AI base |
+| `HUMAN` | `#3B82F6` blue | Organic variance, idiom, imperfection |
+
 **Humanize** — designed from `mechanics-of-ai-writing-detection.md`. Detectors
 weigh rhythm and discourse shape (T2) and missing particulars (T3) far more than
 individual words (T1), and sentence-by-sentence paraphrase makes text *more*
@@ -36,7 +81,7 @@ uniform (§4.4.3). So the humanizer:
 2. Groups each run of consecutive flagged sentences into a **passage** and
    rewrites it as a unit, free to merge, split and cut, which is the only way to
    change sentence-length rhythm.
-3. Gives each passage **specific notes** from `glitch/style.py` (zero tokens):
+3. Gives each passage **specific notes** from `backend/glitch/style.py` (zero tokens):
    flat rhythm, LLM-lexicon words, tricolons, stock openers and closers,
    trailing participial clauses, uniform hedging.
 4. **Validates locally** (zero tokens): lost numbers/names → retry, then keep
@@ -63,20 +108,40 @@ with real, specific details scored 0%, which is why the UI points users to the
 grounding tips.
 
 Both features are limited to **2,500 words** per request (`MAX_WORDS` in
-`glitch/config.py`); the UI warns live and the server enforces it.
+`backend/glitch/config.py`); the UI warns live and the server enforces it.
 
 ---
 
 ## Architecture
 
 ```
-browser (static/app.js)
-   │  /api/analyze · /api/humanize · /api/models · /api/keys/identify
+glitch-detect/
+├── backend/                 FastAPI app (Python)
+│   ├── main.py              launcher: banner, free port, uvicorn
+│   ├── glitch/              the application package
+│   ├── tests/               unit tests + provider stub
+│   └── requirements*.txt
+├── frontend/                static site, no build step, no templating
+│   ├── index.html
+│   └── static/              style.css, app.js
+├── docs/                    ADMIN_DASHBOARD.md, screenshot
+└── run.sh  .env  instance/  (instance/ = admin-added keys, git-ignored)
+```
+
+The backend serves the frontend from the same origin (`/`, `/static/…`, and
+any `frontend/<name>.html` at `/<name>`), so the local-only host check and the
+strict CSP keep working and no CORS is needed. Point `GLITCH_FRONTEND_DIR` at
+another folder to serve a different build. The frontend gets its limits,
+defaults and tone list from `GET /api/config`.
+
+```
+browser (frontend/static/app.js)
+   │  /api/config · /api/analyze · /api/humanize · /api/models · /api/keys/identify
    ▼
-glitch/web.py ─ local-only guard, validation, word limit, CSP, admin API
-   │
+glitch/api.py ─ FastAPI: host guard, JSON-only writes, request models,
+   │            error envelope, CSP, admin API, frontend serving
    ├─ analyzer.py ─┐   (detection: jobs + caches)
-   ├─ humanize.py ─┤   (rewrite: jobs + caches)
+   ├─ humanize.py ─┤   (rewrite: passages + style.py notes/validation)
    │               ▼
    │          routing.py ─ jobs → parallel runner → ModelRouter
    │               │       (balancing · fallback · cooldowns · budgets)
@@ -88,28 +153,31 @@ glitch/web.py ─ local-only guard, validation, word limit, CSP, admin API
                 providers.py ─ data-only registry of OpenAI-compatible providers
 ```
 
+Endpoints are plain `def` functions (model calls use blocking HTTP); FastAPI
+runs them in its worker thread pool.
+
 | File | Role |
 |---|---|
-| `app.py` | Launcher: banner, free-port search, `app.run` |
-| `glitch/config.py` | `.env` loading, limits, paths, admin token |
-| `glitch/providers.py` | Provider registry: URLs, key patterns, billing, model rules |
-| `glitch/keys.py` | Key recognition, verification, server key store |
-| `glitch/catalogue.py` | Model listing and ranking, fallback order, reasoning options |
-| `glitch/routing.py` | Shared job runner: balancing, fallback, cooldowns |
-| `glitch/client.py` | Pooled HTTP session, retries, upstream error mapping |
-| `glitch/cache.py` | Thread-safe TTL/LRU cache keyed by SHA-256 fingerprints |
-| `glitch/prompt.py` | Detection prompts (quick + verbatim classic) and rewrite prompt |
-| `glitch/parsing.py` | Tolerant parsers for labels, sentences, and rewrites |
-| `glitch/text.py` | Sentence splitting, chunking, highlight HTML, sentence replacement |
-| `glitch/analyzer.py` | Detection: jobs, sentence/section caches, scoring |
-| `glitch/humanize.py` | Rewrite: passages, notes, validation, re-scoring, second pass |
-| `glitch/style.py` | Zero-token style analysis: rhythm, AI phrases, voice, grounding tips |
-| `glitch/web.py` | Flask app factory and routes |
-| `templates/index.html` | Sidebar app: Check text, Humanize, Settings, Account |
-| `static/style.css` | Design tokens, highlight classes, layout |
-| `static/app.js` | Routing, settings/keys, checks, rewrites, plain-language errors |
-| `tests/test_glitch.py` | Unit tests (offline: network is blocked in tests) |
-| `tests/stub_provider.py` | Local provider double for E2E checks (labels, rewrites, 429s) |
+| `backend/main.py` | Launcher: banner, free-port search, `uvicorn.run` |
+| `backend/glitch/api.py` | FastAPI app: routes, request models, middleware, frontend serving |
+| `backend/glitch/config.py` | `.env` loading, limits, paths, admin token |
+| `backend/glitch/providers.py` | Provider registry: URLs, key patterns, billing, model rules |
+| `backend/glitch/keys.py` | Key recognition, verification, server key store |
+| `backend/glitch/catalogue.py` | Model listing and ranking, fallback order, reasoning options |
+| `backend/glitch/routing.py` | Shared job runner: balancing, fallback, cooldowns |
+| `backend/glitch/client.py` | Pooled HTTP session, retries, upstream error mapping |
+| `backend/glitch/cache.py` | Thread-safe TTL/LRU cache keyed by SHA-256 fingerprints |
+| `backend/glitch/prompt.py` | Detection prompts (quick + verbatim classic) and rewrite prompt |
+| `backend/glitch/parsing.py` | Tolerant parsers for labels, sentences, and rewrites |
+| `backend/glitch/text.py` | Sentence splitting, chunking, highlight HTML, span replacement |
+| `backend/glitch/analyzer.py` | Detection: jobs, sentence/section caches, scoring |
+| `backend/glitch/humanize.py` | Rewrite: passages, notes, validation, re-scoring, second pass |
+| `backend/glitch/style.py` | Zero-token style analysis: rhythm, AI phrases, voice, grounding tips |
+| `frontend/index.html` | Sidebar app: Check text, Humanize, Settings, Account |
+| `frontend/static/style.css` | Design tokens, highlight classes, layout |
+| `frontend/static/app.js` | Routing, settings/keys, checks, rewrites, plain-language errors |
+| `backend/tests/test_glitch.py` | Unit + API tests (offline: network is blocked in tests) |
+| `backend/tests/stub_provider.py` | FastAPI provider double for E2E checks (labels, rewrites, 429s) |
 
 ### Parsing ladder
 
@@ -130,7 +198,7 @@ canonical classes). Unknown labels default to `HUMAN` with a warning.
 ## Providers and keys
 
 Every provider speaks the OpenAI-compatible chat API, so each one is a data
-entry in `glitch/providers.py`:
+entry in `backend/glitch/providers.py`:
 
 | Provider | Key format | Billing | Models allowed |
 |---|---|---|---|
@@ -144,7 +212,7 @@ entry in `glitch/providers.py`:
 | xAI | `xai-…` | paid | 〃 |
 | Together AI | `tgp_v1_…`, 64 hex | paid | 〃 |
 
-**How a key is resolved** (`glitch/keys.py`):
+**How a key is resolved** (`backend/glitch/keys.py`):
 
 1. *Recognise* — match the key against each provider's `key_patterns`.
 2. *Confirm* — call that provider's `/models` with the key. A key is only ever
@@ -191,7 +259,9 @@ curl -s -X POST http://127.0.0.1:8501/api/admin/keys \
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | App |
+| `GET` | `/` · `/<page>` | Frontend (`frontend/index.html`, `frontend/<page>.html`) |
+| `GET` | `/docs` · `/openapi.json` | Interactive API docs and schema |
+| `GET` | `/api/config` | Limits, defaults, tones and voices for the frontend |
 | `GET` | `/api/health` · `/api/providers` | Providers and whether each is ready (never keys) |
 | `POST` | `/api/keys/identify` | `{key}` → `{provider, label, verified}`; nothing stored |
 | `POST` | `/api/models` | `{provider, api_keys?, force?}` → ranked model list |
@@ -294,31 +364,33 @@ Other failures:
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip install -r backend/requirements-dev.txt   # once (httpx for TestClient)
+.venv/bin/python -m unittest discover -s backend/tests -v
 ```
 
 The suite covers fenced/wrapped/truncated JSON, synonym labels, XSS escaping,
 paragraph reconstruction, chunk limits, parallel ordering, score arithmetic, the
 exact system prompt, free-model enforcement, model fallback and cooldowns,
-`.env`/key resolution, the local-only guard, and upstream error mapping.
+`.env`/key resolution, the admin API, the humanizer, the local-only guard,
+JSON-only writes, the error envelope, page serving, and upstream error mapping.
 
 End-to-end UI check without spending credits:
 
 ```bash
 # terminal 1 (optionally make a model answer 429 to exercise fallback)
-STUB_RATE_LIMITED=google/gemma-4-31b-it:free .venv/bin/python tests/stub_provider.py
+STUB_RATE_LIMITED=google/gemma-4-31b-it:free .venv/bin/python backend/tests/stub_provider.py
 # terminal 2
 OPENROUTER_BASE_URL=http://127.0.0.1:8599/v1 \
 GROQ_BASE_URL=http://127.0.0.1:8599/v1 \
 OPENROUTER_API_KEY=sk-or-stub-key-0000 \
-.venv/bin/python app.py
+.venv/bin/python backend/main.py
 ```
 
 ---
 
 ## Customising the palette
 
-All colours live in `:root` in `static/style.css`:
+All colours live in `:root` in `frontend/static/style.css`:
 
 ```css
 --red:   #EF4444;  --red-text:   #FCA5A5;  /* AI generated  */

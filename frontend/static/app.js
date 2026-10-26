@@ -3,11 +3,12 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
-  const body = document.body.dataset;
   const MIN_KEY = 12;
   const UI_TIMEOUT_MS = 240000;
-  const MIN_CHARS = Number(body.minChars) || 80;
-  const MAX_WORDS = Number(body.maxWords) || 2500;
+  // Defaults until /api/config answers (see loadConfig).
+  let MIN_CHARS = 80;
+  let MAX_WORDS = 2500;
+  let DEFAULT_MODEL = "";
   const VIEWS = ["check", "humanize", "settings", "account"];
 
   const els = {
@@ -98,7 +99,7 @@
   };
 
   const DEFAULT_SETTINGS = {
-    provider: body.defaultProvider || "openrouter",
+    provider: "openrouter",
     models: {},
     fallback: true,
     crossProvider: true,
@@ -237,7 +238,7 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
 
   function currentModel() {
     const p = state.settings.provider;
-    return state.settings.models[p] || state.providers[p]?.default_model || body.defaultModel || "";
+    return state.settings.models[p] || state.providers[p]?.default_model || DEFAULT_MODEL || "";
   }
 
   async function loadProviders() {
@@ -940,11 +941,42 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
   });
 
   /* ─────────────────────────── init ─────────────────────────── */
-  load();
-  fillSettings();
-  renderProfile();
-  updateStats();
-  updateHumanizeStats();
-  showView(location.hash.slice(1));
-  loadProviders();
+  /** Limits, defaults and tone list from the API (the frontend is static). */
+  async function loadConfig() {
+    try {
+      const res = await fetch("/api/config", { cache: "no-store" });
+      const cfg = await res.json();
+      MIN_CHARS = cfg.min_chars || MIN_CHARS;
+      MAX_WORDS = cfg.max_words || MAX_WORDS;
+      DEFAULT_MODEL = cfg.default_model || "";
+      if (!store.get("localStorage", "glitch_settings") && cfg.default_provider) {
+        state.settings.provider = cfg.default_provider;
+      }
+      if (cfg.max_chars) els.text.maxLength = cfg.max_chars;
+      els.text.placeholder = `Paste an essay, article, email… anything with at least a few sentences (up to ${MAX_WORDS.toLocaleString()} words).`;
+      if (Array.isArray(cfg.tones) && cfg.tones.length) {
+        els.humanizeTone.replaceChildren(
+          ...cfg.tones.map((tone) => {
+            const option = document.createElement("option");
+            option.value = tone;
+            option.textContent = tone.charAt(0).toUpperCase() + tone.slice(1);
+            return option;
+          })
+        );
+      }
+    } catch {
+      /* keep defaults; loadProviders reports the node as offline */
+    }
+  }
+
+  (async () => {
+    load();
+    renderProfile();
+    showView(location.hash.slice(1));
+    await loadConfig();
+    fillSettings();
+    updateStats();
+    updateHumanizeStats();
+    loadProviders();
+  })();
 })();

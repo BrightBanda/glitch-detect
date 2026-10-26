@@ -1,5 +1,8 @@
 """Runtime configuration: ``.env`` loading, server limits, storage paths.
 
+Layout: ``<project>/backend/glitch`` (this package), ``<project>/frontend``
+(static site served by the API), ``<project>/.env`` and ``<project>/instance``.
+
 Provider endpoints and key variable names live in ``providers.py``; key
 handling lives in ``keys.py``.
 """
@@ -9,10 +12,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = BACKEND_DIR.parent
 
 
-def load_dotenv(path: Path = ROOT / ".env") -> None:
+def load_dotenv(path: Path = PROJECT_ROOT / ".env") -> None:
     """Minimal ``KEY=VALUE`` reader. Real environment variables take precedence."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -41,7 +45,10 @@ APP_TITLE = "Glitch//Detect"
 APP_URL = "http://localhost:8501"
 
 # Server-side state (admin-added API keys). Kept out of version control.
-INSTANCE_DIR = Path(os.environ.get("GLITCH_INSTANCE_DIR", ROOT / "instance"))
+INSTANCE_DIR = Path(os.environ.get("GLITCH_INSTANCE_DIR", PROJECT_ROOT / "instance"))
+
+# The static frontend the API serves at "/". Override to serve a build elsewhere.
+FRONTEND_DIR = Path(os.environ.get("GLITCH_FRONTEND_DIR", PROJECT_ROOT / "frontend"))
 
 # Enables the /api/admin/* endpoints when set; requests must send
 # "Authorization: Bearer <ADMIN_TOKEN>".

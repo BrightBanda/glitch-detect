@@ -15,9 +15,11 @@ import json
 import os
 import re
 
-from flask import Flask, jsonify, request
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-app = Flask(__name__)
+app = FastAPI(title="Glitch//Detect provider stub")
 
 SPLIT = re.compile(r'(?<=[.!?])\s+')
 RATE_LIMITED = {
@@ -58,8 +60,7 @@ def humanize(sentence: str) -> str:
 @app.get("/v1/models")
 def models():
     """Union of OpenRouter-style free models and Groq Free Plan models."""
-    return jsonify(
-        {
+    return {
             "object": "list",
             "data": [
                 {
@@ -88,17 +89,19 @@ def models():
                 {"id": "whisper-large-v3", "context_window": 0, "active": True},
             ],
         }
-    )
 
 
 @app.post("/v1/chat/completions")
-def completions():
-    body = request.get_json(force=True, silent=True) or {}
+async def completions(request: Request):
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
     if body.get("model") in RATE_LIMITED:
-        return (
-            jsonify({"error": {"message": "Rate limit exceeded (stub)", "code": 429}}),
-            429,
-            {"Retry-After": "30"},
+        return JSONResponse(
+            {"error": {"message": "Rate limit exceeded (stub)", "code": 429}},
+            status_code=429,
+            headers={"Retry-After": "30"},
         )
     messages = body.get("messages") or []
     user = ""
@@ -130,8 +133,7 @@ def completions():
     content = "```json\n" + json.dumps(payload) + "\n```"
     prompt_tokens = sum(len(m.get("content") or "") for m in messages) // 4
 
-    return jsonify(
-        {
+    return {
             "id": "gen-test",
             "model": body.get("model", "stub"),
             "choices": [
@@ -143,8 +145,7 @@ def completions():
             ],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(content) // 4},
         }
-    )
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8599, debug=False, use_reloader=False)
+    uvicorn.run(app, host="127.0.0.1", port=8599, log_level="warning")

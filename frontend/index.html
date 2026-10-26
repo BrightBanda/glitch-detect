@@ -9,11 +9,10 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;900&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap">
-<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-<script src="{{ url_for('static', filename='app.js') }}" defer></script>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
 </head>
-<body data-default-provider="{{ default_provider }}" data-default-model="{{ default_model }}"
-      data-min-chars="{{ min_chars }}" data-max-words="{{ max_words }}">
+<body>
 <div class="bg-grid" aria-hidden="true"></div>
 
 <div class="shell">
@@ -61,8 +60,8 @@
 
       <section class="panel editor-panel" id="editorPanel">
         <div class="textarea-shell">
-          <textarea id="text" spellcheck="false" maxlength="{{ max_chars }}" aria-label="Text to check"
-            placeholder="Paste an essay, article, email… anything with at least a few sentences (up to {{ '{:,}'.format(max_words) }} words)."></textarea>
+          <textarea id="text" spellcheck="false" aria-label="Text to check"
+            placeholder="Paste an essay, article, email… anything with at least a few sentences."></textarea>
           <div class="scan-sweep" aria-hidden="true"></div>
         </div>
 
@@ -73,7 +72,7 @@
           </button>
           <button id="sampleBtn" class="btn-ghost" type="button">Try an example</button>
           <button id="clearBtn" class="btn-ghost" type="button">Clear</button>
-          <span class="text-stats" id="textStats" data-state="ok">0 / {{ '{:,}'.format(max_words) }} words</span>
+          <span class="text-stats" id="textStats" data-state="ok">0 words</span>
         </div>
         <p class="limit-note" id="limitNote" role="status" hidden></p>
         <p class="progress-note" id="progressNote" hidden>Reading your text… longer pieces can take up to a minute.</p>
@@ -188,7 +187,7 @@
             placeholder="Paste the text you want to rewrite, or press “Humanize flagged” after a check."></textarea>
           <div class="scan-sweep" aria-hidden="true"></div>
         </div>
-        <p class="text-stats humanize-stats" id="humanizeStats" data-state="ok">0 / {{ '{:,}'.format(max_words) }} words</p>
+        <p class="text-stats humanize-stats" id="humanizeStats" data-state="ok">0 words</p>
         <p class="limit-note" id="humanizeLimitNote" role="status" hidden></p>
 
         <div class="humanize-options">
@@ -203,7 +202,7 @@
             <div>
               <label class="field-label" for="humanizeTone">Tone</label>
               <select id="humanizeTone">
-                {% for key in tones %}<option value="{{ key }}">{{ key|capitalize }}</option>{% endfor %}
+                <option value="natural">Natural</option>
               </select>
             </div>
           </div>
@@ -310,7 +309,7 @@
         <label class="field-label" for="model">Model</label>
         <div class="model-row">
           <select id="model" aria-describedby="modelHint">
-            <option value="{{ default_model }}">{{ default_model }}</option>
+            <option value="">Recommended model</option>
           </select>
           <button id="refreshModels" class="mini-btn" type="button" aria-label="Refresh model list" title="Refresh list">⟳</button>
         </div>

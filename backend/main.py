@@ -1,7 +1,11 @@
 """Glitch//Detect launcher.
 
-Run:  python app.py
-Then open the printed URL. Application code lives in the ``glitch`` package.
+Run:  python backend/main.py        (or ./run.sh from the project root)
+Then open the printed URL. The API lives in the ``glitch`` package; the
+frontend in ../frontend is served by the same app.
+
+For development with auto-reload:
+    uvicorn main:app --app-dir backend --reload --port 8501
 """
 
 from __future__ import annotations
@@ -9,6 +13,8 @@ from __future__ import annotations
 import logging
 import socket
 import sys
+
+import uvicorn
 
 from glitch import config, create_app, keys
 from glitch.providers import PROVIDERS
@@ -43,20 +49,14 @@ def main() -> None:
 
     banner = f"""
 \033[38;5;51m  GLITCH//DETECT\033[0m
-\033[38;5;213m  LOCAL FORENSICS NODE\033[0m  ·  multi-provider
+\033[38;5;213m  LOCAL FORENSICS NODE\033[0m  ·  multi-provider · FastAPI
 \033[1;97m  ➜  {url}\033[0m
-\033[38;5;245m  {key_line}
+\033[38;5;245m  API docs: {url}/docs
+  {key_line}
   Ctrl+C to stop.\033[0m
 """
     print(banner, flush=True)
-    app.run(
-        host=config.HOST,
-        port=port,
-        debug=False,
-        threaded=True,
-        use_reloader=False,
-        load_dotenv=False,  # glitch.config already read .env
-    )
+    uvicorn.run(app, host=config.HOST, port=port, log_level="info")
 
 
 if __name__ == "__main__":
