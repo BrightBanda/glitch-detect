@@ -1,126 +1,213 @@
-"""Humanize: rewrite AI-sounding sentences so they read naturally.
+"""Humanize: rewrite AI-sounding passages so they read as one person's writing.
 
-Token-lean by design:
+Design follows mechanics-of-ai-writing-detection.md. Detectors lean on rhythm
+and discourse shape (T2) and on missing particulars (T3) far more than on
+single words (T1), and sentence-by-sentence paraphrase makes text *more*
+uniform (§4.4.3). So:
 
-* only sentences labelled AI or AI-polished are rewritten (labels come from
-  the last check, or from the quick-mode detector, which is cached);
-* each target travels with at most one neighbour on each side as read-only
-  context, never the whole document;
-* the model returns only the rewritten sentences, keyed by number;
-* rewrites are cached per sentence + tone + selected model, so repeating or
-  editing a request re-sends only what changed;
-* output budgets are sized to the targets, via the shared router (fallback,
-  balancing, low reasoning effort).
+1. **Passages, not sentences.** Each run of consecutive flagged sentences in a
+   paragraph is rewritten as one unit, free to merge, split, reorder and cut —
+   the only way to change sentence-length rhythm and redundancy.
+2. **Specific notes.** ``style.rewrite_notes`` tells the model exactly what
+   this passage does wrong (flat rhythm, these words, this tricolon…).
+3. **Free validation.** ``style.check_rewrite`` checks each rewrite locally.
+   Lost numbers/names → retry, then keep the original if still lost.
+   Remaining AI patterns → one retry with that feedback.
+4. **Honest grounding.** No invented facts. Paragraphs that only make general
+   claims are returned as tips for the writer to add real detail (§2.5, §2.8:
+   the one thing that moves the deepest signals is authorship).
 
-After rewriting, the result is re-scored with the quick detector (only the
-new sentences cost tokens). An optional second pass rewrites sentences that
-still look AI-written.
+Token-lean: only flagged passages travel, each with one neighbouring sentence
+of context; replies contain only rewritten passages; results are cached per
+passage + tone + model; re-scoring sends only new sentences.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 
-from . import catalogue, config
+from . import catalogue, config, style
 from .analyzer import REASONING_HEADROOM, label_sentences
 from .cache import TTLCache, fingerprint
 from .errors import DetectorError
 from .parsing import parse_rewrites
-from .prompt import HUMANIZE_VERSION, TONES, build_humanize_messages
+from .prompt import HUMANIZE_VERSION, TONES, VOICES, build_humanize_messages
 from .providers import PROVIDERS, get_provider, validate_key, validate_model
 from .routing import Candidate, Job, ScanOptions, make_router, run_jobs, summarize
-from .text import document_sentences, replace_sentences
+from .text import document_sentences, locate_sentences, paragraph_sentences, replace_spans
 
 FLAGGED = ("AI", "REFINED")
-GROUP_WORDS = 350          # target words per request: keeps replies short and reliable
-REWRITE_TEMPERATURE = 0.7  # rewriting needs variety; detection runs at 0
+GROUP_WORDS = 400           # passage words per request: keeps replies short and reliable
+REWRITE_TEMPERATURE = 0.9   # varied word choice raises perplexity; detection runs at 0
 REWRITE_CACHE = TTLCache(5_000, 6 * 3600)
 
 
-def _budget(candidate: Candidate, target_chars: int) -> int:
-    budget = 64 + int(target_chars / 3.2 * 1.4)  # rewritten text ≈ 1.0–1.3x + JSON
-    if catalogue.is_reasoning(candidate.provider, candidate.model):
-        budget += REASONING_HEADROOM
-    return max(128, budget)
+@dataclass
+class Passage:
+    number: int                 # 1-based id used in the prompt and reply
+    indices: list[int]          # consecutive sentence indices in the document
+    text: str
+    before: str | None = None   # neighbouring sentences, read-only context
+    after: str | None = None
+    notes: list[str] = field(default_factory=list)
 
 
-def _groups(targets: list[int], sentences: list[str]) -> list[list[int]]:
-    groups: list[list[int]] = []
+def _passages(
+    paragraphs: list[list[str]], targets: set[int], *, whole_paragraphs: bool
+) -> list[Passage]:
+    sentences = [s for p in paragraphs for s in p]
+    doc_rhythm = style.sentence_cv(sentences)
+    passages: list[Passage] = []
+    offset = 0
+    for paragraph in paragraphs:
+        run: list[int] = []
+        indices = list(range(offset, offset + len(paragraph)))
+        for index in indices + [None]:
+            if index is not None and (whole_paragraphs or index in targets):
+                run.append(index)
+                continue
+            if run:
+                text = " ".join(sentences[i] for i in run)
+                passages.append(
+                    Passage(
+                        number=len(passages) + 1,
+                        indices=run,
+                        text=text,
+                        before=sentences[run[0] - 1] if run[0] > 0 else None,
+                        after=sentences[run[-1] + 1] if run[-1] + 1 < len(sentences) else None,
+                        notes=style.rewrite_notes(text, document_rhythm=doc_rhythm),
+                    )
+                )
+                run = []
+        offset += len(paragraph)
+    return passages
+
+
+def _groups(passages: list[Passage]) -> list[list[Passage]]:
+    groups: list[list[Passage]] = []
     words = 0
-    for index in targets:
-        count = len(sentences[index].split())
+    for passage in passages:
+        count = len(passage.text.split())
         if groups and words + count <= GROUP_WORDS:
-            groups[-1].append(index)
+            groups[-1].append(passage)
             words += count
         else:
-            groups.append([index])
+            groups.append([passage])
             words = count
     return groups
 
 
-def _job(group: list[int], sentences: list[str], tone: str, scope: tuple) -> Job:
-    targets = set(group)
-    shown: list[int] = []
-    for index in group:
-        for neighbour in (index - 1, index, index + 1):
-            if 0 <= neighbour < len(sentences) and neighbour not in shown:
-                shown.append(neighbour)
-    shown.sort()
-    items = [(i + 1 if i in targets else None, sentences[i]) for i in shown]
-    numbers = [i + 1 for i in group]
+def _budget(candidate: Candidate, chars: int) -> int:
+    budget = 96 + int(chars / 3.2 * 1.5)  # rewritten text ≈ 0.8–1.3x + JSON
+    if catalogue.is_reasoning(candidate.provider, candidate.model):
+        budget += REASONING_HEADROOM
+    return max(160, budget)
 
-    def parse(raw: str):
-        rewrites, warnings = parse_rewrites(raw, numbers)
-        out = {n - 1: text for n, text in rewrites.items()}
-        for index, text in out.items():
-            REWRITE_CACHE.put((*scope, fingerprint(sentences[index])), text)
-        return out, warnings
 
-    target_chars = sum(len(sentences[i]) for i in group)
+def _job(group: list[Passage], tone: str, voice: str, extra_notes: dict[int, list[str]]) -> Job:
+    items: list[tuple[str, str]] = []
+    for passage in group:
+        if passage.before and (not items or items[-1][1] != passage.before):
+            items.append(("context", passage.before))
+        items.append((str(passage.number), passage.text))
+        notes = passage.notes + extra_notes.get(passage.number, [])
+        if notes:
+            items.append((f"{passage.number} notes", " ".join(notes)))
+        if passage.after:
+            items.append(("context", passage.after))
+    numbers = [p.number for p in group]
+    chars = sum(len(p.text) for p in group)
     return Job(
-        messages=build_humanize_messages(items, tone),
-        parse=parse,
-        budget=lambda c: _budget(c, target_chars),
+        messages=build_humanize_messages(items, tone, voice),
+        parse=lambda raw: parse_rewrites(raw, numbers),
+        budget=lambda c: _budget(c, chars),
         temperature=REWRITE_TEMPERATURE,
     )
 
 
-def _rewrite(
-    indices: list[int],
-    sentences: list[str],
-    *,
-    provider: str,
-    model: str,
-    keys: dict,
-    tone: str,
-    options: ScanOptions,
-    deadline: float,
-) -> tuple[dict[int, str], dict, int]:
-    """Rewrite sentences at ``indices``; returns (rewrites, run info, cache hits)."""
-    scope = (HUMANIZE_VERSION, provider, model, tone)
-    rewrites: dict[int, str] = {}
-    pending: list[int] = []
-    for index in indices:
-        hit = REWRITE_CACHE.get((*scope, fingerprint(sentences[index])))
-        if hit is None:
-            pending.append(index)
-        else:
-            rewrites[index] = hit
-
-    groups = _groups(pending, sentences)
-    router = make_router(provider, model, keys, options, jobs=len(groups))
-    jobs = [_job(g, sentences, tone, scope) for g in groups]
-    results = run_jobs(
-        jobs, router=router, primary=provider, keys=keys, options=options, deadline=deadline
+def _run(groups: list[list[Passage]], style_key: tuple[str, str], extra: dict[int, list[str]], route: dict):
+    router = make_router(
+        route["provider"], route["model"], route["keys"], route["options"], jobs=len(groups)
     )
+    jobs = [_job(g, *style_key, extra) for g in groups]
+    results = run_jobs(
+        jobs,
+        router=router,
+        primary=route["provider"],
+        keys=route["keys"],
+        options=route["options"],
+        deadline=route["deadline"],
+    )
+    rewrites: dict[int, str] = {}
     warnings: list[str] = []
     for result in results:
         rewrites.update(result.value)
         warnings += [w for w in result.warnings if w not in warnings]
-    info = summarize(results, router)
-    info["warnings"] = warnings
-    info["calls"] = len(groups)
-    return rewrites, info, len(indices) - len(pending)
+    return rewrites, summarize(results, router), warnings
+
+
+def _rewrite(
+    passages: list[Passage],
+    *,
+    tone: str,
+    voice: str,
+    route: dict,
+    fresh: bool = False,
+    extra_notes: dict[int, list[str]] | None = None,
+) -> tuple[dict[int, str], list[dict], int, list[str]]:
+    """Rewrite passages with validation. Returns (rewrites, run infos, cache hits, warnings)."""
+    scope = (HUMANIZE_VERSION, route["provider"], route["model"], tone, voice)
+    extra = dict(extra_notes or {})
+    rewrites: dict[int, str] = {}
+    pending: list[Passage] = []
+    for passage in passages:
+        hit = None if fresh else REWRITE_CACHE.get((*scope, fingerprint(passage.text)))
+        if hit is None:
+            pending.append(passage)
+        else:
+            rewrites[passage.number] = hit
+    reused = len(passages) - len(pending)
+
+    infos: list[dict] = []
+    warnings: list[str] = []
+    if pending:
+        found, info, found_warnings = _run(_groups(pending), (tone, voice), extra, route)
+        infos.append(info)
+        warnings += found_warnings
+
+        # Free local validation; one targeted retry for passages that fail it.
+        retry: dict[int, list[str]] = {}
+        for passage in pending:
+            if passage.number not in found:
+                continue
+            lost, problems = style.check_rewrite(passage.text, found[passage.number], voice=voice)
+            if lost or problems:
+                retry[passage.number] = lost + problems
+        if retry:
+            again = [p for p in pending if p.number in retry]
+            notes = {n: extra.get(n, []) + ["Your last attempt needs fixing:"] + retry[n] for n in retry}
+            second, info, more = _run(_groups(again), (tone, voice), notes, route)
+            infos.append(info)
+            warnings += [w for w in more if w not in warnings]
+            found.update(second)
+
+        protected = 0
+        for passage in pending:
+            new = found.get(passage.number)
+            if new is None:
+                continue
+            lost, _ = style.check_rewrite(passage.text, new)
+            if lost:
+                protected += 1  # keep the original rather than drop facts
+                continue
+            rewrites[passage.number] = new
+            REWRITE_CACHE.put((*scope, fingerprint(passage.text)), new)
+        if protected:
+            warnings.append(
+                f"Kept the original wording for {protected} passage(s) so no names or numbers were lost."
+            )
+    return rewrites, infos, reused, warnings
 
 
 def _score(labels: list[str]) -> int:
@@ -128,7 +215,7 @@ def _score(labels: list[str]) -> int:
     return int(round(100 * flagged / len(labels))) if labels else 0
 
 
-def _merge_usage(*infos: dict) -> dict:
+def _merge_usage(infos: list[dict]) -> dict:
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for info in infos:
         for name in usage:
@@ -143,18 +230,20 @@ def humanize(
     model: str = "",
     keys: dict,
     tone: str = "natural",
+    voice: str = "personal",
     only_flagged: bool = True,
     labels: list[dict] | None = None,
-    second_pass: bool = False,
+    second_pass: bool = True,
     score_after_rewrite: bool = True,
+    fresh: bool = False,
     options: ScanOptions | None = None,
 ) -> dict:
     started = time.monotonic()
-    deadline = started + config.SCAN_DEADLINE_S
     options = options or ScanOptions()
     spec = get_provider(provider)
     keys = {p: (keys or {}).get(p, "").strip() for p in PROVIDERS}
     tone = tone if tone in TONES else "natural"
+    voice = voice if voice in VOICES else "personal"
 
     text = (text or "").strip()
     if not text:
@@ -162,104 +251,129 @@ def humanize(
     validate_key(spec.id, keys[spec.id])
     model = (model or "").strip() or spec.default_model
     validate_model(spec.id, model)
-    route = dict(provider=spec.id, model=model, keys=keys, options=options, deadline=deadline)
+    route = dict(
+        provider=spec.id, model=model, keys=keys, options=options,
+        deadline=started + config.SCAN_DEADLINE_S,
+    )
 
-    sentences = document_sentences(text)
+    paragraphs = paragraph_sentences(text)
+    sentences = [s for p in paragraphs for s in p]
     if not sentences:
         raise DetectorError("Paste a few full sentences to rewrite.", status=400)
 
     # 1. Labels: reuse the client's last check; label only what's missing.
+    #    Client labels are trusted for this request but never cached.
     known = {
         str(item.get("text", "")): str(item.get("classification", "")).upper()
         for item in (labels or [])
         if isinstance(item, dict)
     }
     infos: list[dict] = []
-    if only_flagged:
-        missing = [s for s in sentences if s not in known]
-        if missing:
-            fresh, info = label_sentences(missing, **route)
-            known.update(fresh)
-            infos.append(info)
-        before = [known.get(s, "HUMAN") for s in sentences]
-        targets = [i for i, label in enumerate(before) if label in FLAGGED]
-    else:
-        before = [known.get(s, "") for s in sentences]
-        targets = list(range(len(sentences)))
-    score_before = _score(before) if all(before) else None
+    missing = [s for s in dict.fromkeys(sentences) if s not in known]
+    if missing and (only_flagged or score_after_rewrite):
+        found_labels, info = label_sentences(missing, **route)
+        known.update(found_labels)
+        infos.append(info)
+    before_labels = [known.get(s, "HUMAN") for s in sentences]
+    targets = {i for i, label in enumerate(before_labels) if label in FLAGGED or not only_flagged}
+    score_before = _score(before_labels) if all(s in known for s in sentences) else None
+    style_before = style.analyze_style(text)
 
-    if not targets:
+    def finish(new_text: str, html: str, applied: list[Passage], rewrites: dict[int, str],
+               reused: int, warnings: list[str], score_after: int | None) -> dict:
         return {
-            "text": text,
-            "html": replace_sentences(text, sentences, {})[1],
-            "changes": [],
-            "rewritten": 0,
-            "targets": 0,
-            "reused": 0,
+            "text": new_text,
+            "html": html,
+            "changes": [{"before": p.text, "after": rewrites[p.number]} for p in applied],
+            "passages": len(applied),
+            "rewritten": sum(len(p.indices) for p in applied),
+            "targets": len(targets),
+            "reused": reused,
             "score_before": score_before,
-            "score_after": score_before,
+            "score_after": score_after,
+            "style": {
+                "before": style_before.as_dict(),
+                "after": style.analyze_style(new_text).as_dict(),
+                "human_rhythm": list(style.HUMAN_CV),
+            },
+            "tips": style.grounding_tips(new_text),
             "tone": tone,
-            "usage": _merge_usage(*infos),
-            "warnings": [],
-            "fallbacks": [],
-            "models_used": [],
+            "voice": voice,
+            "usage": _merge_usage(infos),
+            "warnings": warnings,
+            "fallbacks": [s for i in infos for s in i.get("fallbacks", [])],
+            "models_used": next((i["models_used"] for i in reversed(infos) if i.get("models_used")), []),
             "elapsed_ms": int((time.monotonic() - started) * 1000),
         }
 
-    # 2. Rewrite flagged sentences (cache first).
-    rewrites, rewrite_info, reused = _rewrite(targets, sentences, tone=tone, **route)
-    infos.append(rewrite_info)
-    warnings = list(rewrite_info["warnings"])
-    new_text, html = replace_sentences(text, sentences, rewrites)
+    if not targets:
+        return finish(text, replace_spans(text, [])[1], [], {}, 0, [], score_before)
 
-    # 3. Re-score. Unchanged sentences keep their known labels; only the
-    #    rewritten ones are sent (and the client's labels are never cached).
-    def rescore(new_text: str) -> int:
-        new_sentences = document_sentences(new_text)
-        missing = [s for s in dict.fromkeys(new_sentences) if s not in known]
-        if missing:
-            fresh, info = label_sentences(missing, **route)
-            known.update(fresh)
+    # 2. Rewrite flagged passages (cache, validation, one targeted retry).
+    passages = _passages(paragraphs, targets, whole_paragraphs=not only_flagged)
+    rewrites, run_infos, reused, warnings = _rewrite(
+        passages, tone=tone, voice=voice, route=route, fresh=fresh
+    )
+    infos += run_infos
+
+    spans = locate_sentences(text, sentences)
+
+    def apply() -> tuple[str, str, list[Passage]]:
+        edits, applied = [], []
+        for passage in passages:
+            if passage.number not in rewrites:
+                continue
+            first, last = spans[passage.indices[0]], spans[passage.indices[-1]]
+            if first is None or last is None:
+                continue  # couldn't place it safely; leave the original
+            edits.append((first[0], last[1], rewrites[passage.number]))
+            applied.append(passage)
+        new_text, html = replace_spans(text, edits)
+        return new_text, html, applied
+
+    new_text, html, applied = apply()
+    skipped = len([p for p in passages if p.number in rewrites]) - len(applied)
+    if skipped:
+        warnings.append(f"{skipped} passage(s) couldn't be placed back safely and were left as written.")
+
+    # 3. Re-score: unchanged sentences keep their labels; only new ones are sent.
+    def rescore(candidate_text: str) -> int:
+        new_sentences = document_sentences(candidate_text)
+        unseen = [s for s in dict.fromkeys(new_sentences) if s not in known]
+        if unseen:
+            found, info = label_sentences(unseen, **route)
+            known.update(found)
             infos.append(info)
         return _score([known.get(s, "HUMAN") for s in new_sentences])
 
-    score_after = None
-    if score_after_rewrite or second_pass:
-        score_after = rescore(new_text)
-        # Optionally give rewrites that still look AI-written one more pass.
-        still = [i for i, s in rewrites.items() if known.get(s) in FLAGGED] if second_pass else []
+    score_after = rescore(new_text) if (score_after_rewrite or second_pass) else None
+
+    # 4. Extra polish: re-do passages whose rewrite still reads as AI, telling
+    #    the model what it produced last time.
+    if second_pass:
+        still = [
+            p for p in applied
+            if any(known.get(s) in FLAGGED for s in document_sentences(rewrites[p.number]))
+        ]
         if still:
-            current = list(sentences)
-            for i in still:
-                current[i] = rewrites[i]
-            again, info, _ = _rewrite(still, current, tone=tone, **route)
-            infos.append(info)
+            notes = {
+                p.number: [
+                    "A detector still reads your last version as AI-written: "
+                    f"“{rewrites[p.number]}”. Change the structure more, not just the words: "
+                    "different sentence count, uneven lengths, plainer verbs."
+                ]
+                for p in still
+            }
+            again, more_infos, _, more = _rewrite(
+                still, tone=tone, voice=voice, route=route, fresh=True, extra_notes=notes
+            )
+            infos += more_infos
+            warnings += [w for w in more if w not in warnings]
             rewrites.update(again)
-            new_text, html = replace_sentences(text, sentences, rewrites)
+            new_text, html, applied = apply()
             score_after = rescore(new_text)
 
-    if len(rewrites) < len(targets):
-        unchanged = len(targets) - len(rewrites)
-        note = f"{unchanged} flagged sentence(s) were left as they were."
-        if note not in warnings:
-            warnings.append(note)
-
-    fallbacks = [s for i in infos for s in i.get("fallbacks", [])]
-    return {
-        "text": new_text,
-        "html": html,
-        "changes": [
-            {"index": i, "before": sentences[i], "after": rewrites[i]} for i in sorted(rewrites)
-        ],
-        "rewritten": len(rewrites),
-        "targets": len(targets),
-        "reused": reused,
-        "score_before": score_before,
-        "score_after": score_after,
-        "tone": tone,
-        "usage": _merge_usage(*infos),
-        "warnings": warnings,
-        "fallbacks": fallbacks,
-        "models_used": rewrite_info["models_used"],
-        "elapsed_ms": int((time.monotonic() - started) * 1000),
-    }
+    unchanged = len(targets) - sum(len(p.indices) for p in applied)
+    if unchanged > 0 and only_flagged:
+        warnings.append(f"{unchanged} flagged sentence(s) were left as they were.")
+    return finish(new_text, html, applied, rewrites, reused, warnings, score_after)

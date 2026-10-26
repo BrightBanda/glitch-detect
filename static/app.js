@@ -49,6 +49,15 @@
     humanizeLimitNote: $("humanizeLimitNote"),
     useLastCheck: $("useLastCheck"),
     humanizeTone: $("humanizeTone"),
+    humanizeVoice: $("humanizeVoice"),
+    tryAgain: $("tryAgain"),
+    styleShift: $("styleShift"),
+    rhythmBefore: $("rhythmBefore"),
+    rhythmAfter: $("rhythmAfter"),
+    phrasesBefore: $("phrasesBefore"),
+    phrasesAfter: $("phrasesAfter"),
+    groundingTips: $("groundingTips"),
+    tipList: $("tipList"),
     onlyFlagged: $("onlyFlagged"),
     secondPass: $("secondPass"),
     humanizeBtn: $("humanizeBtn"),
@@ -99,6 +108,7 @@
     balance: true,
     rememberKeys: false,
     tone: "natural",
+    voice: "personal",
   };
 
   const state = {
@@ -372,6 +382,7 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     els.chunkWords.value = s.chunkWords;
     els.concurrency.value = String([0, 1, 4].includes(s.concurrency) ? s.concurrency : 0);
     els.humanizeTone.value = s.tone;
+    els.humanizeVoice.value = s.voice;
   }
 
   function readOptions() {
@@ -739,18 +750,40 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     if (result.targets === 0) {
       note = "Nothing needed rewriting: none of the sentences look AI-written.";
     } else {
-      note = `Rewrote ${result.rewritten} of ${plural(result.targets, "flagged sentence")}.`;
-      if (result.reused) note += ` ${result.reused} came from an earlier rewrite, so they were instant.`;
+      note = `Rewrote ${plural(result.rewritten, "flagged sentence")} in ${plural(result.passages, "passage")}.`;
+      if (result.reused) note += " Some came from an earlier rewrite, so they were instant.";
       if (result.rewritten < result.targets) note += " The rest were left as they were.";
     }
     if (result.fallbacks && result.fallbacks.length) note += " The AI service was busy, so a backup model helped.";
     els.rewriteNote.textContent = note;
 
+    const st = result.style || {};
+    els.styleShift.hidden = !(st.before && st.after) || result.rewritten === 0;
+    if (!els.styleShift.hidden) {
+      const fmt = (v) => (v === null || v === undefined ? "—" : Number(v).toFixed(2));
+      els.rhythmBefore.textContent = fmt(st.before.rhythm);
+      els.rhythmAfter.textContent = fmt(st.after.rhythm);
+      els.rhythmAfter.dataset.good = String((st.after.rhythm || 0) >= 0.5);
+      els.phrasesBefore.textContent = st.before.ai_phrases;
+      els.phrasesAfter.textContent = st.after.ai_phrases;
+      els.phrasesAfter.dataset.good = String(st.after.ai_phrases === 0);
+    }
+
+    const tips = result.tips || [];
+    els.tipList.replaceChildren(
+      ...tips.map((tip) => {
+        const li = document.createElement("li");
+        li.textContent = `Paragraph ${tip.paragraph}: “${tip.opening}…”`;
+        return li;
+      })
+    );
+    els.groundingTips.hidden = tips.length === 0;
+
     els.humanizeResult.hidden = false;
     els.humanizeResult.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  async function runHumanize() {
+  async function runHumanize({ fresh = false } = {}) {
     if (state.busy) return;
     const text = els.humanizeInput.value.trim();
     hideAlert(els.hAlert);
@@ -768,6 +801,8 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
       const { res, data } = await postJson("/api/humanize", {
         text,
         tone: els.humanizeTone.value,
+        voice: els.humanizeVoice.value,
+        fresh,
         only_flagged: els.onlyFlagged.checked,
         second_pass: els.secondPass.checked,
         labels,
@@ -845,9 +880,14 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
 
   els.humanizeInput.addEventListener("input", updateHumanizeStats);
   els.useLastCheck.addEventListener("click", useLastCheck);
-  els.humanizeBtn.addEventListener("click", runHumanize);
+  els.humanizeBtn.addEventListener("click", () => runHumanize());
+  els.tryAgain.addEventListener("click", () => runHumanize({ fresh: true }));
   els.humanizeTone.addEventListener("change", () => {
     state.settings.tone = els.humanizeTone.value;
+    saveSettings();
+  });
+  els.humanizeVoice.addEventListener("change", () => {
+    state.settings.voice = els.humanizeVoice.value;
     saveSettings();
   });
   els.copyRewrite.addEventListener("click", copyRewrite);

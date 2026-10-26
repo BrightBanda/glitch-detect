@@ -27,58 +27,40 @@ cp .env.example .env      # add at least one API key
 ```
 
 Open the URL, paste text, press **CHECK TEXT**. Flagged sentences can be sent to
-**Humanize** with one click.
+**Humanize** — designed from `mechanics-of-ai-writing-detection.md`. Detectors
+weigh rhythm and discourse shape (T2) and missing particulars (T3) far more than
+individual words (T1), and sentence-by-sentence paraphrase makes text *more*
+uniform (§4.4.3). So the humanizer:
 
-### API keys — no provider needed
-
-Just add the key; the provider is recognised automatically.
-
-```
-# .env
-LLM_API_KEYS=gsk_…, AIza…, sk-or-v1-…
-```
-
-Provider-specific variables (`GROQ_API_KEY`, `GEMINI_API_KEY`, …) also work. In
-the app, **Settings → Your own API keys** takes any supported key the same way.
-See [Providers and keys](#providers-and-keys).
-
-Manual equivalent of `run.sh`:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python app.py
-```
-
----
-
-## What it does
-
-**Check text**
-1. Splits the document into sentences (quick mode) or sections (classic mode).
-2. Looks every sentence up in the cache; only new or edited sentences are sent.
-3. Sends them in parallel through the shared router (balancing, fallback,
-   sized token budgets).
-4. Parses the reply tolerantly, scores `(AI + REFINED) / total × 100`, and
-   rebuilds the original text as colour-coded `<span>`s.
-
-| Class | Colour | Meaning |
-|---|---|---|
-| `AI` | `#EF4444` red | Machine-generated: high predictability, flat rhythm |
-| `REFINED` | `#F59E0B` amber | Paraphrased / polished over an AI base |
-| `HUMAN` | `#3B82F6` blue | Organic variance, idiom, imperfection |
-
-**Humanize**
 1. Uses the labels from the last check (or labels the text in quick mode).
-2. Rewrites only `AI` / `REFINED` sentences, each sent with one neighbour on
-   either side as read-only context; the model returns only the rewritten
-   sentences, keyed by number.
-3. Swaps them back into the original, keeping spacing and paragraphs.
-4. Re-scores only the rewritten sentences and shows *before → after*.
-   *Extra polish* rewrites anything still flagged once more.
+2. Groups each run of consecutive flagged sentences into a **passage** and
+   rewrites it as a unit, free to merge, split and cut, which is the only way to
+   change sentence-length rhythm.
+3. Gives each passage **specific notes** from `glitch/style.py` (zero tokens):
+   flat rhythm, LLM-lexicon words, tricolons, stock openers and closers,
+   trailing participial clauses, uniform hedging.
+4. **Validates locally** (zero tokens): lost numbers/names → retry, then keep
+   the original; leftover AI patterns, flat rhythm (CV < 0.5) or, in
+   *personal* voice, no voice markers → one targeted retry.
+5. Re-scores only the new sentences, and by default (*Extra polish*) rewrites
+   passages the detector still flags once more, showing the model its last
+   attempt.
+6. Returns before/after **sentence variety** and **AI-phrase counts**, plus
+   **grounding tips**: paragraphs that only make general claims. No facts are
+   invented; specific detail is the writer's to add.
 
-Tones: natural, casual, academic, professional. Rewrites are cached per
-sentence + tone + model, so repeats cost nothing.
+Voices: *personal* (default: first person, takes a position, may add
+opinions; the UI asks the user to check them) and *faithful* (meaning and
+perspective kept). Tones: natural, casual, academic, professional. Rewrites
+are cached per passage + tone + voice + model; *Try another version* skips the
+cache.
+
+Measured on a live model (Groq `gpt-oss-120b`) with a fully generic AI
+paragraph: the sentence-level rewriter left it at 100% in every run; the
+passage-level design gave 18%, 50% and 67% over three runs (median 50%),
+using about 7K tokens with Extra polish (about 3.5K without). The same claims
+with real, specific details scored 0%, which is why the UI points users to the
+grounding tips.
 
 Both features are limited to **2,500 words** per request (`MAX_WORDS` in
 `glitch/config.py`); the UI warns live and the server enforces it.
@@ -120,7 +102,8 @@ glitch/web.py ─ local-only guard, validation, word limit, CSP, admin API
 | `glitch/parsing.py` | Tolerant parsers for labels, sentences, and rewrites |
 | `glitch/text.py` | Sentence splitting, chunking, highlight HTML, sentence replacement |
 | `glitch/analyzer.py` | Detection: jobs, sentence/section caches, scoring |
-| `glitch/humanize.py` | Rewrite: targets, context, caching, re-scoring, second pass |
+| `glitch/humanize.py` | Rewrite: passages, notes, validation, re-scoring, second pass |
+| `glitch/style.py` | Zero-token style analysis: rhythm, AI phrases, voice, grounding tips |
 | `glitch/web.py` | Flask app factory and routes |
 | `templates/index.html` | Sidebar app: Check text, Humanize, Settings, Account |
 | `static/style.css` | Design tokens, highlight classes, layout |
@@ -213,7 +196,7 @@ curl -s -X POST http://127.0.0.1:8501/api/admin/keys \
 | `POST` | `/api/keys/identify` | `{key}` → `{provider, label, verified}`; nothing stored |
 | `POST` | `/api/models` | `{provider, api_keys?, force?}` → ranked model list |
 | `POST` | `/api/analyze` | `{text, provider, model, api_keys?, …options}` → score, sentences, HTML |
-| `POST` | `/api/humanize` | `{text, provider, model, api_keys?, tone?, only_flagged?, second_pass?, labels?, …options}` → rewritten text, HTML, changes, before/after score |
+| `POST` | `/api/humanize` | `{text, provider, model, api_keys?, tone?, voice?, only_flagged?, second_pass?, fresh?, labels?, …options}` → rewritten text, HTML, changes, before/after score and style, grounding tips |
 
 Options shared by analyze and humanize: `chunk_words`, `concurrency`,
 `fallback`, `cross_provider`, `compact`, `balance`. `api_keys` maps provider id

@@ -247,9 +247,11 @@ def create_app() -> Flask:
                 model=str(payload.get("model") or "").strip(),
                 keys=_keys_from(payload, provider),
                 tone=str(payload.get("tone") or "natural"),
+                voice=str(payload.get("voice") or "personal"),
                 only_flagged=payload.get("only_flagged", True) is not False,
                 labels=labels if isinstance(labels, list) else None,
-                second_pass=bool(payload.get("second_pass")),
+                second_pass=payload.get("second_pass", True) is not False,
+                fresh=bool(payload.get("fresh")),
                 options=_options(payload),
             )
         except DetectorError:

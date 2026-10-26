@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from glitch import analyzer, cache, catalogue, client, config, create_app, keys, routing  # noqa: E402
 from glitch.providers import PROVIDERS  # noqa: E402
 from glitch import humanize as humanize_mod  # noqa: E402
+from glitch import style  # noqa: E402
 from glitch.errors import DetectorError, ModelFailure, ParseError, RateLimited  # noqa: E402
 from glitch.parsing import content_to_text, parse_analysis, parse_labels  # noqa: E402
 from glitch.prompt import COMPACT_SYSTEM_PROMPT, SYSTEM_PROMPT, build_messages  # noqa: E402
@@ -972,76 +973,113 @@ class HumanizeTests(unittest.TestCase):
     def setUp(self):
         reset_state()
         self.requests = []
+        self.rewrite = lambda passage, body: f"Plainly put, {passage[0].lower()}{passage[1:]}"
+
+    @staticmethod
+    def data(messages):
+        return messages[1]["content"].split("===DATA START===\n")[1].split("\n===DATA END===")[0]
 
     def fake(self, messages, api_key, model, provider, **kw):
-        system = messages[0]["content"]
-        body = messages[1]["content"].split("===DATA START===\n")[1].split("\n===DATA END===")[0]
+        import re
+        system, body = messages[0]["content"], self.data(messages)
         self.requests.append({"system": system, "body": body, **kw})
         if '"rewrites"' in system:
-            import re
-            targets = re.findall(r"^\[(\d+)\] (.*)$", body, re.MULTILINE)
-            return json.dumps({"rewrites": {n: f"Plainly: {t.lower()}" for n, t in targets}})
+            passages = re.findall(r"^\[(\d+)\] (.*)$", body, re.MULTILINE)
+            return json.dumps({"rewrites": {n: self.rewrite(t, body) for n, t in passages}})
         lines = [line.split(". ", 1)[1] for line in body.splitlines()]
-        return json.dumps({"labels": ["AI" if not l.startswith("Plainly") else "HUMAN" for l in lines]})
+        return json.dumps({"labels": ["HUMAN" if l.startswith("Plainly") else "AI" for l in lines]})
 
-    def run_humanize(self, **kw):
+    def rewrites_sent(self):
+        return [r for r in self.requests if '"rewrites"' in r["system"]]
+
+    def run_humanize(self, text=None, **kw):
+        kw.setdefault("labels", self.LABELS if text is None else None)
         with mock.patch.object(client, "request_chunk", side_effect=self.fake):
             return humanize_mod.humanize(
-                kw.pop("text", self.TEXT), provider="openrouter", model="test/model:free",
+                text or self.TEXT, provider="openrouter", model="test/model:free",
                 keys={"openrouter": OR_KEY}, options=routing.ScanOptions(fallback=False), **kw,
             )
 
-    def test_rewrites_only_flagged_sentences_with_context(self):
-        result = self.run_humanize(labels=self.LABELS)
-        rewrite = next(r for r in self.requests if '"rewrites"' in r["system"])
-        self.assertIn("[1] The system is robust", rewrite["body"])
-        self.assertIn("[context] I rewrote it twice", rewrite["body"])
-        self.assertIn("[3] Ultimately", rewrite["body"])
-        self.assertEqual(rewrite["temperature"], humanize_mod.REWRITE_TEMPERATURE)
-        self.assertEqual(result["rewritten"], 2)
-        self.assertIn("I rewrote it twice before it worked.", result["text"])  # untouched
-        self.assertIn("\n\nPlainly: ultimately", result["text"])           # paragraphs kept
-        self.assertIn('<span class="hw">Plainly: the system', result["html"])
+    def test_flagged_passages_sent_with_context_and_specific_notes(self):
+        result = self.run_humanize()
+        body = self.rewrites_sent()[0]["body"]
+        self.assertIn("[1] The system is robust and scalable.", body)
+        self.assertIn("[1 notes]", body)
+        self.assertIn("robust", body.split("[1 notes]")[1].split("\n")[0])
+        self.assertIn("[context] I rewrote it twice", body)
+        self.assertIn("[2] Ultimately", body)
+        self.assertIn("summing-up opener", body)
+        self.assertEqual(self.rewrites_sent()[0]["temperature"], humanize_mod.REWRITE_TEMPERATURE)
+        self.assertIn("I rewrote it twice before it worked.", result["text"])  # human, untouched
+        self.assertIn("\n\nPlainly put, ultimately", result["text"])        # paragraphs kept
+        self.assertIn('<span class="hw">Plainly put, the system', result["html"])
+        self.assertEqual((result["passages"], result["rewritten"], result["targets"]), (2, 2, 2))
         self.assertEqual((result["score_before"], result["score_after"]), (67, 0))
+        self.assertIn("rhythm", result["style"]["before"])
 
-    def test_repeat_request_uses_cache(self):
-        self.run_humanize(labels=self.LABELS)
-        count = len(self.requests)
-        second = self.run_humanize(labels=self.LABELS)
-        self.assertEqual(len(self.requests), count)  # nothing new sent
+    def test_consecutive_flagged_sentences_become_one_passage(self):
+        text = ("Moreover, it is robust. Furthermore, it is seamless. Additionally, it is holistic.\n\n"
+                "My cat sat on the keyboard at 3am and deleted the draft.")
+        self.rewrite = lambda passage, body: "Plainly put, it works. Mostly."
+        labels = [{"text": s, "classification": "AI"} for s in
+                  ("Moreover, it is robust.", "Furthermore, it is seamless.", "Additionally, it is holistic.")]
+        labels.append({"text": "My cat sat on the keyboard at 3am and deleted the draft.", "classification": "HUMAN"})
+        result = self.run_humanize(text, labels=labels)
+        body = self.rewrites_sent()[0]["body"]
+        self.assertIn("[1] Moreover, it is robust. Furthermore, it is seamless. Additionally, it is holistic.", body)
+        self.assertNotIn("[2]", body)
+        self.assertEqual((result["passages"], result["rewritten"]), (1, 3))
+        self.assertTrue(result["text"].startswith("Plainly put, it works. Mostly.\n\nMy cat"))
+
+    def test_rewrite_that_keeps_ai_patterns_is_retried_with_feedback(self):
+        def rewrite(passage, body):
+            return "It plays a crucial role here." if "last attempt" not in body else "Plainly put, it matters."
+        self.rewrite = rewrite
+        result = self.run_humanize()
+        retry = self.rewrites_sent()[1]["body"]
+        self.assertIn("Your last attempt needs fixing", retry)
+        self.assertIn("crucial", retry)
+        self.assertNotIn("crucial", result["text"])
+
+    def test_lost_numbers_keep_the_original(self):
+        text = "Revenue grew 42% in 2023 at Acme. It was robust growth.\n\nI was there for it, honestly."
+        labels = [
+            {"text": "Revenue grew 42% in 2023 at Acme.", "classification": "AI"},
+            {"text": "It was robust growth.", "classification": "AI"},
+            {"text": "I was there for it, honestly.", "classification": "HUMAN"},
+        ]
+        self.rewrite = lambda passage, body: "Plainly put, revenue went up a lot."
+        result = self.run_humanize(text, labels=labels)
+        self.assertEqual(len(self.rewrites_sent()), 2)  # one retry, naming what was lost
+        self.assertIn("42%", self.rewrites_sent()[1]["body"].split("last attempt")[1])
+        self.assertEqual(result["passages"], 0)
+        self.assertEqual(result["text"], text)
+        self.assertTrue(any("Kept the original wording" in w for w in result["warnings"]))
+
+    def test_repeat_uses_cache_and_fresh_skips_it(self):
+        self.run_humanize()
+        count = len(self.rewrites_sent())
+        second = self.run_humanize()
+        self.assertEqual(len(self.rewrites_sent()), count)
         self.assertEqual(second["reused"], 2)
+        self.run_humanize(fresh=True)
+        self.assertGreater(len(self.rewrites_sent()), count)
+
+    def test_second_pass_shows_the_model_its_last_attempt(self):
+        def rewrite(passage, body):
+            return "Plainly put, it is fine." if "still reads your last version" in body else "Robotic version of it."
+        self.rewrite = rewrite
+        result = self.run_humanize(second_pass=True)
+        last = self.rewrites_sent()[-1]["body"]
+        self.assertIn("still reads your last version", last)
+        self.assertIn("Robotic version of it.", last)
+        self.assertIn("[1] The system is robust", last)  # re-done from the original
+        self.assertEqual(result["score_after"], 0)
 
     def test_labels_are_fetched_when_not_supplied(self):
-        result = self.run_humanize()
+        result = self.run_humanize(self.TEXT, labels=None)
         self.assertTrue(any('"labels"' in r["system"] for r in self.requests))
         self.assertEqual(result["targets"], 3)
-
-    def test_second_pass_rewrites_what_still_looks_ai(self):
-        rounds = []
-
-        def fake(messages, api_key, model, provider, **kw):
-            system = messages[0]["content"]
-            body = messages[1]["content"].split("===DATA START===\n")[1].split("\n===DATA END===")[0]
-            if '"rewrites"' in system:
-                import re
-                rounds.append(body)
-                targets = re.findall(r"^\[(\d+)\] (.*)$", body, re.MULTILINE)
-                prefix = "Robotic:" if len(rounds) == 1 else "Plainly:"
-                return json.dumps({"rewrites": {n: f"{prefix} {t}" for n, t in targets}})
-            lines = [line.split(". ", 1)[1] for line in body.splitlines()]
-            return json.dumps({"labels": ["AI" if l.startswith("Robotic") else "HUMAN" for l in lines]})
-
-        with mock.patch.object(client, "request_chunk", side_effect=fake):
-            result = humanize_mod.humanize(
-                self.TEXT, provider="openrouter", model="test/model:free",
-                keys={"openrouter": OR_KEY}, labels=self.LABELS, second_pass=True,
-                options=routing.ScanOptions(fallback=False),
-            )
-        self.assertEqual(len(rounds), 2)
-        self.assertIn("[1] Robotic:", rounds[1])
-        self.assertEqual(result["score_after"], 0)
-        # The second pass rewrote the first rewrite, not the original.
-        self.assertTrue(result["text"].startswith("Plainly: Robotic: The system"))
 
     def test_nothing_to_rewrite(self):
         labels = [dict(item, classification="HUMAN") for item in self.LABELS]
@@ -1054,10 +1092,83 @@ class HumanizeTests(unittest.TestCase):
         with mock.patch.object(client, "request_chunk", side_effect=self.fake):
             response = app.test_client().post("/api/humanize", json={
                 "text": self.TEXT, "model": "test/model:free", "api_keys": {"openrouter": OR_KEY},
-                "labels": self.LABELS, "tone": "casual", "fallback": False,
+                "labels": self.LABELS, "tone": "casual", "fallback": False, "fresh": True,
             })
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(response.get_json()["result"]["tone"], "casual")
+        result = response.get_json()["result"]
+        self.assertEqual(result["tone"], "casual")
+        self.assertIn("tips", result)
+
+
+class StyleTests(unittest.TestCase):
+    AI = ("In today's rapidly evolving digital landscape, artificial intelligence plays a crucial role in shaping "
+          "the future of human communication. By leveraging advanced algorithms, organizations can foster "
+          "innovation, streamline workflows, and unlock unprecedented levels of efficiency. Moreover, these "
+          "systems demonstrate a strong commitment to adaptability in an increasingly complex world.")
+    HUMAN = ("I tried the beta on a Tuesday and it ate four hours of my afternoon. The export button silently "
+             "dropped every table with a merged cell, which I only noticed because a colleague asked why the "
+             "revenue column was empty. It has been two years.")
+
+    def test_ai_and_human_profiles_differ(self):
+        ai, human = style.analyze_style(self.AI), style.analyze_style(self.HUMAN)
+        self.assertGreater(ai.phrase_count, 8)
+        self.assertEqual(human.phrase_count, 0)
+        self.assertGreater(human.rhythm, ai.rhythm)
+
+    def test_rewrite_notes_are_specific(self):
+        notes = " ".join(style.rewrite_notes(self.AI))
+        for expected in ("crucial", "leveraging", "three-part list", "scene-setting opener", "Moreover"):
+            self.assertIn(expected, notes)
+
+    def test_check_rewrite(self):
+        lost, problems = style.check_rewrite(
+            "Sales at Acme grew 42% in 2023.", "The company grew a lot, fostering growth."
+        )
+        self.assertTrue(any("42%" in l and "2023" in l for l in lost))
+        self.assertTrue(any("Acme" in l for l in lost))
+        self.assertTrue(any("fostering" in p or "foster" in p for p in problems))
+        self.assertEqual(style.check_rewrite("Acme grew 42%.", "Acme grew by 42%. Fast."), ([], []))
+
+    def test_tricolons_skip_plain_lists(self):
+        self.assertEqual(style.tricolons("I bought eggs, milk and bread."), [])
+        self.assertTrue(style.tricolons("We value innovation, collaboration, and resilience."))
+        self.assertTrue(style.tricolons("They cut costs, cut down repetitive tasks, and ship faster."))
+
+    def test_tricolon_regex_is_linear_on_long_input(self):
+        import time
+        started = time.monotonic()
+        style.analyze_style(" ".join(["word"] * 3000) + ", x")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_voice_markers_and_personal_validation(self):
+        voiced = "AI is changing how we talk. Fast. I'm less sure the gains are real."
+        self.assertGreaterEqual(len(style.voice_markers(voiced)), 3)
+        flat = "Artificial intelligence changes communication. Organizations adopt new tools quickly."
+        _, problems = style.check_rewrite(flat, flat, voice="personal")
+        self.assertTrue(any("voiceless" in p for p in problems))
+        _, problems = style.check_rewrite(flat, flat, voice="faithful")
+        self.assertFalse(any("voiceless" in p for p in problems))
+
+    def test_grounding_tips_only_for_unanchored_paragraphs(self):
+        tips = style.grounding_tips(self.AI + "\n\n" + self.HUMAN)
+        self.assertEqual([t["paragraph"] for t in tips], [1])
+
+
+class RoutingCostTests(unittest.TestCase):
+    def setUp(self):
+        reset_state()
+
+    def test_unavailable_model_is_skipped_across_runs(self):
+        router = routing.ModelRouter([routing.Candidate("openrouter", "gone/model:free")])
+        router.retire(routing.Candidate("openrouter", "gone/model:free"), ModelFailure("gone", status=404))
+        self.assertGreater(routing.cooldown_remaining("openrouter", "gone/model:free"), 3000)
+
+    def test_fallbacks_prefer_models_that_do_not_reason(self):
+        catalogue._MODEL_CACHE["openrouter"].update(at=1e12, payload={"models": [
+            catalogue._entry("a/thinker:free", "", 0, "recommended", "", reasoning=True),
+            catalogue._entry("b/direct:free", "", 0, "recommended", ""),
+        ]})
+        self.assertEqual(catalogue.fallback_models("openrouter"), ["b/direct:free", "a/thinker:free"])
 
 
 if __name__ == "__main__":

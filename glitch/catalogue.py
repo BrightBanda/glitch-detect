@@ -335,9 +335,12 @@ def fallback_models(provider: str, api_key: str = "", limit: int = 4) -> list[st
     else:
         models = []
 
-    ranked = [m["id"] for m in models if m["group"] == "recommended"]
-    ranked += [m["id"] for m in models if m["group"] == "general" and m["json_capable"]]
-    return ranked[:limit]
+    ranked = [m for m in models if m["group"] == "recommended"]
+    ranked += [m for m in models if m["group"] == "general" and m["json_capable"]]
+    # Prefer models that answer directly: a reasoning model can spend hundreds
+    # of hidden tokens to emit a handful of labels. Stable sort keeps rank order.
+    ranked.sort(key=lambda m: m.get("reasoning", False))
+    return [m["id"] for m in ranked][:limit]
 
 
 def is_reasoning(provider: str, model: str) -> bool:

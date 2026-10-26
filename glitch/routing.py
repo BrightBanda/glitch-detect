@@ -27,6 +27,7 @@ from .errors import DetectorError, ModelFailure, ParseError, RateLimited
 from .providers import PAID, PROVIDERS
 
 DEFAULT_COOLDOWN_S = 60
+UNAVAILABLE_COOLDOWN_S = 3600  # "model not found": skip it for an hour, not just this run
 MAX_CONCURRENCY = 4
 CROSS_PROVIDER_MODELS = 2
 
@@ -125,6 +126,8 @@ class ModelRouter:
     def retire(self, candidate: Candidate, exc: DetectorError) -> None:
         if isinstance(exc, RateLimited):
             start_cooldown(candidate.provider, candidate.model, exc.retry_after)
+        elif exc.status == 404:
+            start_cooldown(candidate.provider, candidate.model, UNAVAILABLE_COOLDOWN_S)
         with self._lock:
             self._retired.add(candidate)
 

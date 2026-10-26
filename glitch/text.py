@@ -29,9 +29,14 @@ def split_sentences(text: str) -> list[str]:
     return [p.strip() for p in _SENT_SPLIT_RE.split(cleaned) if p.strip()]
 
 
+def paragraph_sentences(text: str) -> list[list[str]]:
+    """Sentences grouped by paragraph."""
+    return [found for para in _PARA_SPLIT_RE.split(text) if (found := split_sentences(para))]
+
+
 def document_sentences(text: str) -> list[str]:
     """All sentences in order, split per paragraph so headings stand alone."""
-    return [s for para in _PARA_SPLIT_RE.split(text) for s in split_sentences(para)]
+    return [s for para in paragraph_sentences(text) for s in para]
 
 
 def group_sentences(sentences: list[str], max_words: int = 900) -> list[list[str]]:
@@ -167,23 +172,30 @@ def _paragraph_html(segments: list[tuple[str, bool]]) -> str:
     return "\n".join(f'<p class="doc-para">{p}</p>' for p in paragraphs)
 
 
-def replace_sentences(
-    source: str, sentences: list[str], replacements: dict[int, str]
-) -> tuple[str, str]:
-    """Swap ``replacements`` (sentence index -> new text) into ``source``.
+def replace_spans(source: str, edits: list[tuple[int, int, str]]) -> tuple[str, str]:
+    """Apply non-overlapping ``(start, end, new_text)`` edits to ``source``.
 
-    Returns ``(new text, HTML with replaced sentences marked)``. Spacing and
-    paragraph breaks between sentences are kept exactly.
+    Returns ``(new text, HTML with replaced parts marked)``. Everything between
+    edits — spacing, line and paragraph breaks — is kept exactly.
     """
-    spans = locate_sentences(source, sentences)
     segments: list[tuple[str, bool]] = []
     cursor = 0
-    for index, span in enumerate(spans):
-        if span is None or index not in replacements:
-            continue
-        start, end = span
+    for start, end, new in sorted(edits):
         segments.append((source[cursor:start], False))
-        segments.append((replacements[index], True))
+        segments.append((new, True))
         cursor = end
     segments.append((source[cursor:], False))
     return "".join(t for t, _ in segments), _paragraph_html(segments)
+
+
+def replace_sentences(
+    source: str, sentences: list[str], replacements: dict[int, str]
+) -> tuple[str, str]:
+    """Swap ``replacements`` (sentence index -> new text) into ``source``."""
+    spans = locate_sentences(source, sentences)
+    edits = [
+        (span[0], span[1], replacements[i])
+        for i, span in enumerate(spans)
+        if span is not None and i in replacements
+    ]
+    return replace_spans(source, edits)

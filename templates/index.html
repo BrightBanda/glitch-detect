@@ -192,12 +192,22 @@
         <p class="limit-note" id="humanizeLimitNote" role="status" hidden></p>
 
         <div class="humanize-options">
-          <div>
-            <label class="field-label" for="humanizeTone">Tone</label>
-            <select id="humanizeTone">
-              {% for key in tones %}<option value="{{ key }}">{{ key|capitalize }}</option>{% endfor %}
-            </select>
+          <div class="option-pair">
+            <div>
+              <label class="field-label" for="humanizeVoice">Voice</label>
+              <select id="humanizeVoice">
+                <option value="personal">Your own voice (recommended)</option>
+                <option value="faithful">Stay close to the original</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="humanizeTone">Tone</label>
+              <select id="humanizeTone">
+                {% for key in tones %}<option value="{{ key }}">{{ key|capitalize }}</option>{% endfor %}
+              </select>
+            </div>
           </div>
+          <p class="hint">“Your own voice” writes in the first person and takes a position, which reads far more human. It may add opinions, so check they're really yours.</p>
           <label class="toggle-row" for="onlyFlagged">
             <span>
               <strong>Only rewrite sentences that look AI-written</strong>
@@ -208,9 +218,9 @@
           <label class="toggle-row" for="secondPass">
             <span>
               <strong>Extra polish</strong>
-              <small>Rewrites anything that still looks AI-written once more. Takes longer.</small>
+              <small>Checks the result and rewrites anything that still reads as AI. Better results, about twice the allowance.</small>
             </span>
-            <span class="switch"><input type="checkbox" id="secondPass"><span class="switch-track"><span class="switch-thumb"></span></span></span>
+            <span class="switch"><input type="checkbox" id="secondPass" checked><span class="switch-track"><span class="switch-thumb"></span></span></span>
           </label>
         </div>
 
@@ -242,6 +252,7 @@
         <div class="panel-head">
           <h2>Rewritten</h2>
           <div class="doc-tools">
+            <button class="mini-btn" id="tryAgain" type="button">Try another version</button>
             <button class="mini-btn" id="copyRewrite" type="button">Copy</button>
             <button class="mini-btn accent" id="checkRewrite" type="button">Check this text →</button>
           </div>
@@ -254,6 +265,23 @@
             <span class="shift-label">likely AI</span>
           </div>
           <p class="rewrite-note" id="rewriteNote"></p>
+        </div>
+        <div class="style-shift" id="styleShift" hidden>
+          <div class="metric">
+            <span class="metric-label">Sentence variety</span>
+            <span class="metric-values"><span id="rhythmBefore">—</span> → <strong id="rhythmAfter">—</strong></span>
+            <span class="metric-note">People usually land around 0.5–0.7</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">AI-typical phrases</span>
+            <span class="metric-values"><span id="phrasesBefore">—</span> → <strong id="phrasesAfter">—</strong></span>
+            <span class="metric-note">Stock words, three-part lists, filler openers</span>
+          </div>
+        </div>
+        <div class="tips" id="groundingTips" hidden>
+          <strong>Make it unmistakably yours</strong>
+          <p>Detectors look hardest for real, specific detail, and only you can add it. These parts make general claims; add a real example, a number, a name, a date, or what actually happened:</p>
+          <ul id="tipList"></ul>
         </div>
         <div class="doc-legend"><span><i class="dot changed"></i>Rewritten sentences</span></div>
         <div class="doc" id="humanizeOutput"></div>
