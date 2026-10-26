@@ -8,7 +8,9 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from glitch import analyzer, catalogue, client, config, create_app  # noqa: E402
+from glitch import analyzer, cache, catalogue, client, config, create_app, keys, routing  # noqa: E402
+from glitch.providers import PROVIDERS  # noqa: E402
+from glitch import humanize as humanize_mod  # noqa: E402
 from glitch.errors import DetectorError, ModelFailure, ParseError, RateLimited  # noqa: E402
 from glitch.parsing import content_to_text, parse_analysis, parse_labels  # noqa: E402
 from glitch.prompt import COMPACT_SYSTEM_PROMPT, SYSTEM_PROMPT, build_messages  # noqa: E402
@@ -34,11 +36,13 @@ def _offline(*args, **kwargs):
     raise ConnectionError("network access is disabled in tests")
 
 
-# Never let the developer's real .env keys, or any request, leave a test.
-# Individual tests patch these again with fakes where they need a response.
+# Never let the developer's real keys (.env or instance/keys.json), or any
+# request, leave a test. Tests patch these again where they need a response.
+_TMP = tempfile.TemporaryDirectory()
+_ENV_NAMES = [name for spec in PROVIDERS.values() for name in spec.env_vars] + [keys.GENERIC_ENV_VAR]
 _env_patches = [
-    mock.patch.object(config, "ENV_KEY_ALIASES", {}),
-    mock.patch.dict(os.environ, {name: "" for name in config.ENV_KEY_NAMES.values()}),
+    mock.patch.dict(os.environ, {name: "" for name in _ENV_NAMES}),
+    mock.patch.object(keys, "store", keys.KeyStore(Path(_TMP.name) / "keys.json")),
     mock.patch.object(client._session, "get", side_effect=_offline),
     mock.patch.object(client._session, "post", side_effect=_offline),
 ]
@@ -55,8 +59,8 @@ def tearDownModule():
 
 
 def reset_state():
-    analyzer._cooldowns.clear()
-    analyzer.clear_cache()
+    routing.clear_cooldowns()
+    cache.clear_all()
     for entry in catalogue._MODEL_CACHE.values():
         entry.update(at=0.0, payload=None)
 
@@ -307,11 +311,11 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(result["requested_model"], "a/first:free")
         self.assertEqual(result["fallbacks"][0]["reason"], "rate limited")
         self.assertTrue(any("Switched" in w for w in result["warnings"]))
-        self.assertGreater(analyzer.cooldown_remaining("openrouter", "a/first:free"), 0)
+        self.assertGreater(routing.cooldown_remaining("openrouter", "a/first:free"), 0)
         self.assertNotIn("c/guard:free", [m for _, m, _ in calls])
 
     def test_cooldown_skips_model_on_next_scan(self):
-        analyzer._start_cooldown("openrouter", "a/first:free", 60)
+        routing.start_cooldown("openrouter", "a/first:free", 60)
         result, calls = self.run_scan(lambda p, m: json.dumps(GOOD))
         self.assertEqual(calls[0][1], "b/second:free")
         self.assertTrue(any("cooling down" in w for w in result["warnings"]))
@@ -478,10 +482,10 @@ class ConfigTests(unittest.TestCase):
         for name in ("GLITCH_T_A", "GLITCH_T_B", "GLITCH_T_C"):
             os.environ.pop(name, None)
 
-    def test_user_key_overrides_env_key(self):
-        with mock.patch.dict(os.environ, {"GROQ_API_KEY": "gsk-from-env-0000"}):
-            self.assertEqual(config.resolve_key("groq", ""), "gsk-from-env-0000")
-            self.assertEqual(config.resolve_key("groq", " gsk-user "), "gsk-user")
+    def test_user_key_overrides_server_key(self):
+        with mock.patch.dict(os.environ, {"GROQ_KEY": "gsk-from-env-0000"}):
+            self.assertEqual(keys.resolve_request_keys({})["groq"], "gsk-from-env-0000")
+            self.assertEqual(keys.resolve_request_keys({"groq": " gsk-user "})["groq"], "gsk-user")
 
 
 class WebTests(unittest.TestCase):
@@ -495,7 +499,9 @@ class WebTests(unittest.TestCase):
             body = self.client.get("/api/health").get_data(as_text=True)
             page = self.client.get("/").get_data(as_text=True)
         self.assertNotIn("gsk-secret-value-123", body + page)
-        self.assertTrue(json.loads(body)["providers"]["groq"]["env_key"])
+        providers = {p["id"]: p for p in json.loads(body)["providers"]}
+        self.assertTrue(providers["groq"]["ready"])
+        self.assertFalse(providers["gemini"]["ready"])
 
     def test_non_local_host_rejected(self):
         response = self.client.get("/api/health", headers={"Host": "evil.example:8501"})
@@ -523,9 +529,20 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Settings", response.get_json()["error"]["message"])
 
-    def test_humanize_placeholder(self):
-        response = self.client.post("/api/humanize", json={"text": "x"})
-        self.assertEqual(response.status_code, 501)
+    def test_word_limit(self):
+        long_text = "word " * (config.MAX_WORDS + 1)
+        for route in ("/api/analyze", "/api/humanize"):
+            with self.subTest(route=route):
+                response = self.client.post(route, json={"text": long_text})
+                self.assertEqual(response.status_code, 413)
+                self.assertIn("2,500 words", response.get_json()["error"]["message"])
+
+    def test_providers_endpoint_lists_readiness_without_keys(self):
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "AIza" + "x" * 35}):
+            data = self.client.get("/api/providers").get_json()
+        providers = {p["id"]: p for p in data["providers"]}
+        self.assertTrue(providers["gemini"]["ready"])
+        self.assertNotIn("AIza", json.dumps(data))
 
 
 class CompactModeTests(unittest.TestCase):
@@ -647,22 +664,81 @@ class TokenBudgetTests(unittest.TestCase):
 class CacheTests(unittest.TestCase):
     def setUp(self):
         reset_state()
+        self.sent = []
 
-    def test_recheck_is_served_from_cache(self):
-        reply = '{"labels": ["AI", "HUMAN", "REFINED"]}'
-        options = analyzer.ScanOptions(fallback=False)
-        with mock.patch.object(client, "request_chunk", return_value=reply) as call:
-            first = analyzer.analyze(GOOD_TEXT, model="test/model:free",
-                                     keys={"openrouter": OR_KEY}, options=options)
-            second = analyzer.analyze(GOOD_TEXT, model="test/model:free",
-                                      keys={"openrouter": OR_KEY}, options=options)
-            third = analyzer.analyze(GOOD_TEXT, model="other/model:free",
-                                     keys={"openrouter": OR_KEY}, options=options)
-        self.assertEqual(call.call_count, 2)  # first scan + different model
-        self.assertEqual(first["cached_chunks"], 0)
-        self.assertEqual(second["cached_chunks"], 1)
+    def fake(self, messages, api_key, model, provider, **kw):
+        body = messages[1]["content"].split("===DATA START===\n")[1].split("\n===DATA END===")[0]
+        lines = [line.split(". ", 1)[1] for line in body.splitlines()]
+        self.sent.append(lines)
+        return json.dumps({"labels": ["AI"] * len(lines)})
+
+    def scan(self, text, model="test/model:free", **opts):
+        with mock.patch.object(client, "request_chunk", side_effect=self.fake):
+            return analyzer.analyze(
+                text, model=model, keys={"openrouter": OR_KEY},
+                options=analyzer.ScanOptions(fallback=False, **opts),
+            )
+
+    def test_recheck_sends_nothing(self):
+        first = self.scan(GOOD_TEXT)
+        second = self.scan(GOOD_TEXT)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(second["chunks"], 0)
+        self.assertEqual(second["reused_sentences"], 3)
+        self.assertEqual(second["usage"]["total_tokens"], 0)
         self.assertEqual(second["counts"], first["counts"])
-        self.assertEqual(third["cached_chunks"], 0)
+        self.assertIn("hl ai", second["html"])
+
+    def test_edit_sends_only_changed_sentences(self):
+        self.scan(GOOD_TEXT)
+        edited = GOOD_TEXT.replace("I rewrote it twice", "I rewrote it three times")
+        result = self.scan("New opening line here. " + edited)
+        self.assertEqual(self.sent[1], [
+            "New opening line here.",
+            "I rewrote it three times before it worked.",
+        ])
+        self.assertEqual(result["reused_sentences"], 2)
+        self.assertEqual(result["total"], 4)
+        self.assertEqual(result["sentences"][0]["text"], "New opening line here.")
+
+    def test_duplicate_sentences_sent_once(self):
+        result = self.scan("Same line repeats here. Same line repeats here. Another one here.")
+        self.assertEqual(self.sent[0], ["Same line repeats here.", "Another one here."])
+        self.assertEqual(result["total"], 3)
+
+    def test_cache_is_per_selected_model(self):
+        self.scan(GOOD_TEXT)
+        self.scan(GOOD_TEXT, model="other/model:free")
+        self.assertEqual(len(self.sent), 2)
+
+    def test_finished_groups_survive_a_failed_scan(self):
+        text = "\n\n".join(f"Paragraph number {i} " + "word " * 130 + "end." for i in range(3))
+        calls = []
+
+        def flaky(messages, api_key, model, provider, **kw):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RateLimited("busy")
+            return self.fake(messages, api_key, model, provider, **kw)
+
+        with mock.patch.object(client, "request_chunk", side_effect=flaky), \
+             self.assertRaises(RateLimited):
+            analyzer.analyze(text, model="test/model:free", keys={"openrouter": OR_KEY},
+                             options=analyzer.ScanOptions(chunk_words=150, fallback=False,
+                                                          concurrency=1))
+        result = self.scan(text, chunk_words=150, concurrency=1)
+        self.assertEqual(result["reused_sentences"], 1)
+        self.assertEqual(result["chunks"], 2)
+
+    def test_classic_mode_caches_whole_sections(self):
+        with mock.patch.object(client, "request_chunk", return_value=json.dumps(GOOD)) as call:
+            for _ in range(2):
+                result = analyzer.analyze(
+                    GOOD_TEXT, model="test/model:free", keys={"openrouter": OR_KEY},
+                    options=analyzer.ScanOptions(fallback=False, compact=False),
+                )
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(result["cached_chunks"], 1)
 
 
 class BalancingTests(unittest.TestCase):
@@ -709,6 +785,279 @@ class BalancingTests(unittest.TestCase):
                 options=analyzer.ScanOptions(chunk_words=150, fallback=False, concurrency=1),
             )
         self.assertEqual(calls, ["openai/gpt-oss-120b"])
+
+
+SAMPLE_KEYS = {
+    "openrouter": "sk-or-v1-" + "a" * 64,
+    "groq": "gsk_" + "B" * 52,
+    "gemini": "AIza" + "C" * 35,
+    "cerebras": "csk-" + "d" * 48,
+    "mistral": "E" * 32,
+    "openai": "sk-proj-" + "F" * 100,
+    "deepseek": "sk-" + "0123456789abcdef" * 2,
+    "xai": "xai-" + "G" * 80,
+    "together": "tgp_v1_" + "H" * 40,
+}
+
+
+class KeyResolutionTests(unittest.TestCase):
+    def test_each_provider_is_recognised_by_format(self):
+        for provider, key in SAMPLE_KEYS.items():
+            with self.subTest(provider=provider):
+                self.assertEqual(keys.identify(key), [provider])
+
+    def test_resolve_confirms_with_the_matching_provider_only(self):
+        probed = []
+
+        def fake_probe(key, provider):
+            probed.append(provider)
+            return True
+
+        with mock.patch.object(keys, "probe", side_effect=fake_probe):
+            match = keys.resolve(SAMPLE_KEYS["groq"])
+        self.assertEqual((match.provider, match.verified), ("groq", True))
+        self.assertEqual(probed, ["groq"])  # never sent anywhere else
+
+    def test_unreachable_provider_trusts_unambiguous_format(self):
+        with mock.patch.object(keys, "probe", return_value=None):
+            match = keys.resolve(SAMPLE_KEYS["gemini"])
+        self.assertEqual((match.provider, match.verified), ("gemini", False))
+
+    def test_rejected_and_unknown_keys(self):
+        with mock.patch.object(keys, "probe", return_value=False), \
+             self.assertRaises(DetectorError) as ctx:
+            keys.resolve(SAMPLE_KEYS["groq"])
+        self.assertEqual(ctx.exception.status, 401)
+        with self.assertRaises(DetectorError) as ctx:
+            keys.resolve("not-a-known-key-format!!")
+        self.assertIn("recognise", ctx.exception.message)
+
+    def test_probe_uses_models_endpoint_of_that_provider(self):
+        seen = {}
+
+        def fake_get(url, headers=None, timeout=None):
+            seen.update(url=url, auth=(headers or {}).get("Authorization"))
+            return fake_response(200, {"data": []})
+
+        with mock.patch.object(client._session, "get", side_effect=fake_get):
+            self.assertTrue(keys.probe(SAMPLE_KEYS["gemini"], "gemini"))
+        self.assertTrue(seen["url"].startswith("https://generativelanguage.googleapis.com/"))
+        self.assertTrue(seen["url"].endswith("/models"))
+        self.assertEqual(seen["auth"], "Bearer " + SAMPLE_KEYS["gemini"])
+
+
+class KeyStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "keys.json"
+        self.store = keys.KeyStore(self.path)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_add_list_remove(self):
+        with mock.patch.object(keys, "probe", return_value=True):
+            entry = self.store.add(SAMPLE_KEYS["groq"], "team key")
+            self.store.add(SAMPLE_KEYS["groq"])  # duplicate ignored
+        self.assertEqual(entry["provider"], "groq")
+        self.assertNotIn(SAMPLE_KEYS["groq"], json.dumps(self.store.list()))
+        self.assertEqual(self.store.key_for("groq"), SAMPLE_KEYS["groq"])
+        self.assertEqual(oct(self.path.stat().st_mode & 0o777), "0o600")
+        reloaded = keys.KeyStore(self.path)
+        self.assertEqual(reloaded.key_for("groq"), SAMPLE_KEYS["groq"])
+        self.assertTrue(reloaded.remove(entry["id"]))
+        self.assertEqual(reloaded.key_for("groq"), "")
+
+    def test_environment_keys_including_generic_list(self):
+        env = {"MISTRAL_API_KEY": SAMPLE_KEYS["mistral"],
+               keys.GENERIC_ENV_VAR: f"{SAMPLE_KEYS['xai']}, junk-key-value-here"}
+        with mock.patch.dict(os.environ, env):
+            store = keys.KeyStore(self.path)
+            self.assertEqual(store.ready_providers(), {"mistral", "xai"})
+            sources = {e["provider"]: e["source"] for e in store.list()}
+        self.assertEqual(sources, {"mistral": "env", "xai": "env"})
+
+
+class AdminApiTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patches = [
+            mock.patch.object(keys, "store", keys.KeyStore(Path(self.tmp.name) / "k.json")),
+            mock.patch.object(keys, "probe", return_value=True),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.app = create_app()
+        self.client = self.app.test_client()
+
+    def test_disabled_without_token(self):
+        with mock.patch.object(config, "ADMIN_TOKEN", ""):
+            self.assertEqual(self.client.get("/api/admin/keys").status_code, 404)
+
+    def test_add_list_delete_with_token(self):
+        auth = {"Authorization": "Bearer s3cret-admin"}
+        with mock.patch.object(config, "ADMIN_TOKEN", "s3cret-admin"):
+            self.assertEqual(self.client.get("/api/admin/keys").status_code, 401)
+            self.assertEqual(
+                self.client.get("/api/admin/keys", headers={"Authorization": "Bearer nope"}).status_code,
+                401,
+            )
+            added = self.client.post("/api/admin/keys", json={"key": SAMPLE_KEYS["gemini"]}, headers=auth)
+            self.assertEqual(added.status_code, 201)
+            entry = added.get_json()["key"]
+            self.assertEqual(entry["provider"], "gemini")  # recognised, not specified
+            listed = self.client.get("/api/admin/keys", headers=auth).get_json()
+            self.assertNotIn(SAMPLE_KEYS["gemini"], json.dumps(listed))
+            ready = {p["id"] for p in self.client.get("/api/providers").get_json()["providers"] if p["ready"]}
+            self.assertIn("gemini", ready)
+            gone = self.client.delete(f"/api/admin/keys/{entry['id']}", headers=auth)
+            self.assertEqual(gone.status_code, 200)
+
+    def test_identify_endpoint_does_not_store(self):
+        response = self.client.post("/api/keys/identify", json={"key": SAMPLE_KEYS["cerebras"]})
+        self.assertEqual(response.get_json()["provider"], "cerebras")
+        self.assertEqual(keys.store.ready_providers(), set())
+
+
+class GenericProviderTests(unittest.TestCase):
+    def setUp(self):
+        reset_state()
+
+    def test_generic_models_filter_and_rank(self):
+        items = [
+            {"id": "models/text-embedding-004"},
+            {"id": "models/gemini-2.5-pro"},
+            {"id": "models/gemini-2.5-flash"},
+            {"id": "models/imagen-4"},
+            {"id": "models/gemini-2.5-flash-lite"},
+        ]
+        models = catalogue.generic_models("gemini", items)
+        ids = [m["id"] for m in models]
+        self.assertNotIn("text-embedding-004", ids)
+        self.assertNotIn("imagen-4", ids)
+        self.assertEqual(ids[-1], "gemini-2.5-pro")  # "pro" ranks after fast models
+        self.assertTrue(models[0]["reasoning"])
+
+    def test_request_options_per_provider(self):
+        self.assertEqual(catalogue.request_options("gemini", "gemini-2.5-flash"), {"reasoning_effort": "low"})
+        self.assertEqual(catalogue.request_options("openai", "gpt-4.1-mini"), {})
+        self.assertEqual(catalogue.request_options("openai", "o4-mini"), {"reasoning_effort": "low"})
+
+    def test_fallback_never_moves_onto_a_paid_provider(self):
+        for provider, models in (("openai", ["gpt-x"]), ("gemini", ["gemini-flash"])):
+            catalogue._MODEL_CACHE[provider].update(at=1e12, payload={"models": [
+                catalogue._entry(m, m, 0, "recommended", "") for m in models
+            ]})
+        cands = routing.build_candidates(
+            "groq", "openai/gpt-oss-120b",
+            {"groq": GROQ_KEY, "openai": SAMPLE_KEYS["openai"], "gemini": SAMPLE_KEYS["gemini"]},
+            routing.ScanOptions(),
+        )
+        providers = {c.provider for c in cands}
+        self.assertIn("gemini", providers)
+        self.assertNotIn("openai", providers)
+
+
+class HumanizeTests(unittest.TestCase):
+    TEXT = (
+        "The system is robust and scalable. I rewrote it twice before it worked.\n\n"
+        "Ultimately, the results underscore its importance."
+    )
+    LABELS = [
+        {"text": "The system is robust and scalable.", "classification": "AI"},
+        {"text": "I rewrote it twice before it worked.", "classification": "HUMAN"},
+        {"text": "Ultimately, the results underscore its importance.", "classification": "REFINED"},
+    ]
+
+    def setUp(self):
+        reset_state()
+        self.requests = []
+
+    def fake(self, messages, api_key, model, provider, **kw):
+        system = messages[0]["content"]
+        body = messages[1]["content"].split("===DATA START===\n")[1].split("\n===DATA END===")[0]
+        self.requests.append({"system": system, "body": body, **kw})
+        if '"rewrites"' in system:
+            import re
+            targets = re.findall(r"^\[(\d+)\] (.*)$", body, re.MULTILINE)
+            return json.dumps({"rewrites": {n: f"Plainly: {t.lower()}" for n, t in targets}})
+        lines = [line.split(". ", 1)[1] for line in body.splitlines()]
+        return json.dumps({"labels": ["AI" if not l.startswith("Plainly") else "HUMAN" for l in lines]})
+
+    def run_humanize(self, **kw):
+        with mock.patch.object(client, "request_chunk", side_effect=self.fake):
+            return humanize_mod.humanize(
+                kw.pop("text", self.TEXT), provider="openrouter", model="test/model:free",
+                keys={"openrouter": OR_KEY}, options=routing.ScanOptions(fallback=False), **kw,
+            )
+
+    def test_rewrites_only_flagged_sentences_with_context(self):
+        result = self.run_humanize(labels=self.LABELS)
+        rewrite = next(r for r in self.requests if '"rewrites"' in r["system"])
+        self.assertIn("[1] The system is robust", rewrite["body"])
+        self.assertIn("[context] I rewrote it twice", rewrite["body"])
+        self.assertIn("[3] Ultimately", rewrite["body"])
+        self.assertEqual(rewrite["temperature"], humanize_mod.REWRITE_TEMPERATURE)
+        self.assertEqual(result["rewritten"], 2)
+        self.assertIn("I rewrote it twice before it worked.", result["text"])  # untouched
+        self.assertIn("\n\nPlainly: ultimately", result["text"])           # paragraphs kept
+        self.assertIn('<span class="hw">Plainly: the system', result["html"])
+        self.assertEqual((result["score_before"], result["score_after"]), (67, 0))
+
+    def test_repeat_request_uses_cache(self):
+        self.run_humanize(labels=self.LABELS)
+        count = len(self.requests)
+        second = self.run_humanize(labels=self.LABELS)
+        self.assertEqual(len(self.requests), count)  # nothing new sent
+        self.assertEqual(second["reused"], 2)
+
+    def test_labels_are_fetched_when_not_supplied(self):
+        result = self.run_humanize()
+        self.assertTrue(any('"labels"' in r["system"] for r in self.requests))
+        self.assertEqual(result["targets"], 3)
+
+    def test_second_pass_rewrites_what_still_looks_ai(self):
+        rounds = []
+
+        def fake(messages, api_key, model, provider, **kw):
+            system = messages[0]["content"]
+            body = messages[1]["content"].split("===DATA START===\n")[1].split("\n===DATA END===")[0]
+            if '"rewrites"' in system:
+                import re
+                rounds.append(body)
+                targets = re.findall(r"^\[(\d+)\] (.*)$", body, re.MULTILINE)
+                prefix = "Robotic:" if len(rounds) == 1 else "Plainly:"
+                return json.dumps({"rewrites": {n: f"{prefix} {t}" for n, t in targets}})
+            lines = [line.split(". ", 1)[1] for line in body.splitlines()]
+            return json.dumps({"labels": ["AI" if l.startswith("Robotic") else "HUMAN" for l in lines]})
+
+        with mock.patch.object(client, "request_chunk", side_effect=fake):
+            result = humanize_mod.humanize(
+                self.TEXT, provider="openrouter", model="test/model:free",
+                keys={"openrouter": OR_KEY}, labels=self.LABELS, second_pass=True,
+                options=routing.ScanOptions(fallback=False),
+            )
+        self.assertEqual(len(rounds), 2)
+        self.assertIn("[1] Robotic:", rounds[1])
+        self.assertEqual(result["score_after"], 0)
+        # The second pass rewrote the first rewrite, not the original.
+        self.assertTrue(result["text"].startswith("Plainly: Robotic: The system"))
+
+    def test_nothing_to_rewrite(self):
+        labels = [dict(item, classification="HUMAN") for item in self.LABELS]
+        result = self.run_humanize(labels=labels)
+        self.assertEqual(result["rewritten"], 0)
+        self.assertEqual(self.requests, [])
+
+    def test_endpoint(self):
+        app = create_app()
+        with mock.patch.object(client, "request_chunk", side_effect=self.fake):
+            response = app.test_client().post("/api/humanize", json={
+                "text": self.TEXT, "model": "test/model:free", "api_keys": {"openrouter": OR_KEY},
+                "labels": self.LABELS, "tone": "casual", "fallback": False,
+            })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["result"]["tone"], "casual")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,27 @@ def split_sentences(text: str) -> list[str]:
     return [p.strip() for p in _SENT_SPLIT_RE.split(cleaned) if p.strip()]
 
 
+def document_sentences(text: str) -> list[str]:
+    """All sentences in order, split per paragraph so headings stand alone."""
+    return [s for para in _PARA_SPLIT_RE.split(text) for s in split_sentences(para)]
+
+
+def group_sentences(sentences: list[str], max_words: int = 900) -> list[list[str]]:
+    """Pack sentences into request-sized groups, preserving order."""
+    max_words = max(120, min(int(max_words), 2000))
+    groups: list[list[str]] = []
+    words = 0
+    for sentence in sentences:
+        count = len(sentence.split())
+        if groups and words + count <= max_words:
+            groups[-1].append(sentence)
+            words += count
+        else:
+            groups.append([sentence])
+            words = count
+    return groups
+
+
 def chunk_text(text: str, max_words: int = 900) -> list[str]:
     """Split on paragraph boundaries, then sentence boundaries if needed."""
     max_words = max(120, min(int(max_words), 2000))
@@ -119,3 +140,50 @@ def build_highlight_html(sentences: Iterable[Sentence], source_text: str) -> str
     if not blocks:
         return '<p class="doc-para"><span class="hl human">No sentences returned.</span></p>'
     return "\n".join(blocks)
+
+
+def locate_sentences(source: str, sentences: list[str]) -> list[tuple[int, int] | None]:
+    """Character span of each sentence in ``source``, searching in order."""
+    spans: list[tuple[int, int] | None] = []
+    cursor = 0
+    for sentence in sentences:
+        match = _find_sentence(source, sentence, cursor)
+        if match is None:
+            spans.append(None)
+            continue
+        spans.append((match.start(), match.end()))
+        cursor = match.end()
+    return spans
+
+
+def _paragraph_html(segments: list[tuple[str, bool]]) -> str:
+    """Escaped HTML with changed segments marked, paragraphs preserved."""
+    out = []
+    for text, changed in segments:
+        escaped = html.escape(text)
+        out.append(f'<span class="hw">{escaped}</span>' if changed else escaped)
+    body = "".join(out).strip()
+    paragraphs = [p.replace("\n", "<br>") for p in _PARA_SPLIT_RE.split(body) if p.strip()]
+    return "\n".join(f'<p class="doc-para">{p}</p>' for p in paragraphs)
+
+
+def replace_sentences(
+    source: str, sentences: list[str], replacements: dict[int, str]
+) -> tuple[str, str]:
+    """Swap ``replacements`` (sentence index -> new text) into ``source``.
+
+    Returns ``(new text, HTML with replaced sentences marked)``. Spacing and
+    paragraph breaks between sentences are kept exactly.
+    """
+    spans = locate_sentences(source, sentences)
+    segments: list[tuple[str, bool]] = []
+    cursor = 0
+    for index, span in enumerate(spans):
+        if span is None or index not in replacements:
+            continue
+        start, end = span
+        segments.append((source[cursor:start], False))
+        segments.append((replacements[index], True))
+        cursor = end
+    segments.append((source[cursor:], False))
+    return "".join(t for t, _ in segments), _paragraph_html(segments)

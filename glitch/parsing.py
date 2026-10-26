@@ -286,3 +286,55 @@ def parse_analysis(raw: str) -> tuple[list[Sentence], list[str]]:
         )
 
     return sentences, warnings
+
+
+_REWRITE_PAIR_RE = re.compile(r'"(\d+)"\s*:\s*"((?:\\.|[^"\\])*)"', re.DOTALL)
+
+
+def parse_rewrites(raw: str, expected: list[int]) -> tuple[dict[int, str], list[str]]:
+    """Parse ``{"rewrites": {"3": "..."}}`` (or close variants) into {number: text}."""
+    if not raw or not raw.strip():
+        raise ParseError("The model returned an empty response.")
+    candidate = extract_outermost_json(strip_code_fences(raw))
+    payload = None
+    for text in (candidate, _TRAILING_COMMA_RE.sub(r"\1", candidate)):
+        try:
+            payload = json.loads(text)
+            break
+        except Exception:
+            continue
+
+    found: dict[int, str] = {}
+    if isinstance(payload, dict):
+        inner = payload.get("rewrites", payload)
+        if isinstance(inner, dict):
+            for k, v in inner.items():
+                if str(k).strip().isdigit() and isinstance(v, str):
+                    found[int(k)] = v
+        elif isinstance(inner, list):
+            payload = inner
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            number = next((item[k] for k in ("n", "id", "number", "index") if k in item), None)
+            text = next((item[k] for k in ("text", "rewrite", "rewritten") if k in item), None)
+            if str(number).strip().isdigit() and isinstance(text, str):
+                found[int(number)] = text
+    if not found:
+        found = {int(n): _json_unescape(t) for n, t in _REWRITE_PAIR_RE.findall(candidate)}
+
+    wanted = set(expected)
+    rewrites = {n: WS_RE.sub(" ", t).strip() for n, t in found.items() if n in wanted}
+    rewrites = {n: t for n, t in rewrites.items() if t}
+    if not rewrites:
+        snippet = WS_RE.sub(" ", raw)[:280]
+        raise ParseError(
+            "The model didn't return any rewritten sentences.",
+            detail=f"Raw response began: {snippet}",
+        )
+    warnings = []
+    missing = len(wanted) - len(rewrites)
+    if missing:
+        warnings.append(f"{missing} sentence(s) were left unchanged.")
+    return rewrites, warnings

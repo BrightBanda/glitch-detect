@@ -1,7 +1,7 @@
-"""Runtime configuration: ``.env`` loading, provider endpoints, server limits.
+"""Runtime configuration: ``.env`` loading, server limits, storage paths.
 
-Keys found in the environment (or ``.env``) are server-side defaults. They are
-never sent to the browser; the UI only learns *whether* a default exists.
+Provider endpoints and key variable names live in ``providers.py``; key
+handling lives in ``keys.py``.
 """
 
 from __future__ import annotations
@@ -40,39 +40,20 @@ PORT = int(os.environ.get("PORT", "8501"))
 APP_TITLE = "Glitch//Detect"
 APP_URL = "http://localhost:8501"
 
-OPENROUTER_BASE_URL = os.environ.get(
-    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-).rstrip("/")
-GROQ_BASE_URL = os.environ.get(
-    "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
-).rstrip("/")
+# Server-side state (admin-added API keys). Kept out of version control.
+INSTANCE_DIR = Path(os.environ.get("GLITCH_INSTANCE_DIR", ROOT / "instance"))
 
-ENV_KEY_NAMES = {"openrouter": "OPENROUTER_API_KEY", "groq": "GROQ_API_KEY"}
-# Also accepted, checked after the canonical name.
-ENV_KEY_ALIASES = {
-    "openrouter": ("OPEN_ROUTER_KEY", "OPENROUTER_KEY", "OPEN_ROUTER_API_KEY"),
-    "groq": ("GROQ_KEY",),
-}
+# Enables the /api/admin/* endpoints when set; requests must send
+# "Authorization: Bearer <ADMIN_TOKEN>".
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
 MIN_CHARS = 80
 MAX_CHARS = 60_000
+# Per check / rewrite. Keeps a single request inside free-tier limits.
+MAX_WORDS = 2500
 MIN_KEY_LENGTH = 12
 
 # Whole-scan budget. The browser aborts at 240 s, so the server stops first
 # instead of burning free-tier quota on a result nobody will read.
 SCAN_DEADLINE_S = 225
 CHUNK_TIMEOUT_S = 150
-
-
-def env_key(provider: str) -> str:
-    for name in (ENV_KEY_NAMES.get(provider, ""), *ENV_KEY_ALIASES.get(provider, ())):
-        value = os.environ.get(name, "").strip() if name else ""
-        if value:
-            return value
-    return ""
-
-
-def resolve_key(provider: str, user_key: str = "") -> str:
-    """The user's key for this provider, else the ``.env`` default."""
-    user_key = (user_key or "").strip()
-    return user_key or env_key(provider)

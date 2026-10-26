@@ -39,6 +39,22 @@ def classify(sentence: str) -> str:
     return "HUMAN"
 
 
+STOCK_PHRASES = {
+    "ultimately, ": "", "moreover, ": "", "in today's rapidly evolving digital landscape, ": "these days ",
+    "plays a crucial role in": "matters for", "crucial": "big", "landscape": "scene",
+    "a testament to": "proof of", "testament": "proof", "leveraging": "using", "leverage": "use",
+    "foster": "build", "stakeholders": "people involved",
+}
+
+
+def humanize(sentence: str) -> str:
+    """Crude stand-in rewrite: strips stock phrases so classify() reads it as HUMAN."""
+    out = sentence
+    for phrase, plain in STOCK_PHRASES.items():
+        out = re.sub(re.escape(phrase), plain, out, flags=re.IGNORECASE)
+    return out[:1].upper() + out[1:]
+
+
 @app.get("/v1/models")
 def models():
     """Union of OpenRouter-style free models and Groq Free Plan models."""
@@ -92,9 +108,13 @@ def completions():
 
     match = re.search(r"===DATA START===\s*(.*?)\s*===DATA END===", user, re.DOTALL)
     data = match.group(1) if match else user
-    compact = '"labels"' in (messages[0].get("content") or "")
+    system = messages[0].get("content") or ""
+    compact = '"labels"' in system
 
-    if compact:
+    if '"rewrites"' in system:
+        targets = re.findall(r"^\[(\d+)\] (.*)$", data, re.MULTILINE)
+        payload = {"rewrites": {n: humanize(text) for n, text in targets}}
+    elif compact:
         sentences = [re.sub(r"^\d+\.\s*", "", line) for line in data.splitlines() if line.strip()]
         payload = {"labels": [classify(sentence) for sentence in sentences]}
     else:

@@ -10,7 +10,8 @@ import logging
 import socket
 import sys
 
-from glitch import config, create_app
+from glitch import config, create_app, keys
+from glitch.providers import PROVIDERS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,14 +36,14 @@ def _free_port(start: int) -> int:
 def main() -> None:
     port = _free_port(config.PORT)
     url = f"http://{config.HOST}:{port}"
-    keys = [
-        name for provider, name in config.ENV_KEY_NAMES.items() if config.env_key(provider)
-    ]
-    key_line = f"defaults from .env: {', '.join(keys)}" if keys else "no .env keys — add them in Settings"
+    ready = sorted(PROVIDERS[p].label for p in keys.store.ready_providers())
+    key_line = f"ready: {', '.join(ready)}" if ready else "no API keys yet — add one in Settings"
+    if config.ADMIN_TOKEN:
+        key_line += " · admin API enabled"
 
     banner = f"""
 \033[38;5;51m  GLITCH//DETECT\033[0m
-\033[38;5;213m  LOCAL FORENSICS NODE\033[0m  ·  OpenRouter + Groq transport
+\033[38;5;213m  LOCAL FORENSICS NODE\033[0m  ·  multi-provider
 \033[1;97m  ➜  {url}\033[0m
 \033[38;5;245m  {key_line}
   Ctrl+C to stop.\033[0m

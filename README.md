@@ -1,10 +1,12 @@
 # Glitch//Detect
 
-A local-first, sentence-level AI writing detector with a cyberpunk interface.
-Text is analysed remotely by a **free OpenRouter or Groq model**; the app runs
-entirely on your machine and keeps API keys in your browser tab.
+A local-first, sentence-level AI writing detector and humanizer with a
+cyberpunk interface. Text is analysed by a model from any supported provider
+(OpenRouter, Groq, Gemini, OpenAI, Mistral, Cerebras, DeepSeek, xAI, Together);
+the app runs on your machine and API keys never reach the browser unless the
+user adds their own.
 
-![status](https://img.shields.io/badge/node-local-22D3EE) ![python](https://img.shields.io/badge/python-3.10%2B-3B82F6) ![transport](https://img.shields.io/badge/transport-OpenRouter%20%2B%20Groq-F59E0B)
+![status](https://img.shields.io/badge/node-local-22D3EE) ![python](https://img.shields.io/badge/python-3.10%2B-3B82F6) ![providers](https://img.shields.io/badge/providers-9-F59E0B)
 
 ---
 
@@ -12,33 +14,35 @@ entirely on your machine and keeps API keys in your browser tab.
 
 ```bash
 cd glitch-detect
+cp .env.example .env      # add at least one API key
 ./run.sh
 ```
 
 `run.sh` creates a virtualenv on first run, installs Flask + requests, and prints:
 
 ```
-  LOCAL FORENSICS NODE  ·  OpenRouter + Groq transport
+  LOCAL FORENSICS NODE  ·  multi-provider
   ➜  http://127.0.0.1:8501
+  ready: Groq, OpenRouter
 ```
 
-Open that URL, choose **OPENROUTER** or **GROQ**, paste text, and hit
-**RUN FORENSIC SCAN**. Only free-tier models are listed and accepted.
+Open the URL, paste text, press **CHECK TEXT**. Flagged sentences can be sent to
+**Humanize** with one click.
 
-### API keys
+### API keys — no provider needed
 
-Put default keys in `.env` (see `.env.example`):
+Just add the key; the provider is recognised automatically.
 
 ```
-OPENROUTER_API_KEY=sk-or-v1-…
-GROQ_API_KEY=gsk_…
+# .env
+LLM_API_KEYS=gsk_…, AIza…, sk-or-v1-…
 ```
 
-They stay on the server; the browser only learns that a default exists. Keys
-entered on the **Settings** page override the `.env` defaults per provider
-([OpenRouter keys](https://openrouter.ai/keys) · [Groq keys](https://console.groq.com/keys)).
+Provider-specific variables (`GROQ_API_KEY`, `GEMINI_API_KEY`, …) also work. In
+the app, **Settings → Your own API keys** takes any supported key the same way.
+See [Providers and keys](#providers-and-keys).
 
-Manual equivalent:
+Manual equivalent of `run.sh`:
 
 ```bash
 python3 -m venv .venv
@@ -46,24 +50,17 @@ python3 -m venv .venv
 .venv/bin/python app.py
 ```
 
-Environment variables (or `.env`): `OPENROUTER_API_KEY`, `GROQ_API_KEY`,
-`PORT` (default `8501`), `OPENROUTER_BASE_URL` (default
-`https://openrouter.ai/api/v1`), `GROQ_BASE_URL` (default
-`https://api.groq.com/openai/v1`).
-
 ---
 
 ## What it does
 
-1. Splits the document into API-sized chunks on paragraph boundaries.
-2. Sends the chunks **in parallel** to the selected provider's OpenAI-compatible
-   chat-completions endpoint with the mandated forensic system prompt (verbatim,
-   see `glitch/prompt.py`). If a model is rate limited, gone, or failing, the
-   scan switches to the next free model immediately (see *Rate limits*).
-3. Parses the returned JSON — with fence stripping, trailing-comma repair, and a
-   structural regex fallback for truncated or prose-wrapped responses.
-4. Scores the document as `(AI + REFINED) / total × 100`.
-5. Rebuilds the original text as inline `<span>`s, preserving paragraphs, colour-coded:
+**Check text**
+1. Splits the document into sentences (quick mode) or sections (classic mode).
+2. Looks every sentence up in the cache; only new or edited sentences are sent.
+3. Sends them in parallel through the shared router (balancing, fallback,
+   sized token budgets).
+4. Parses the reply tolerantly, scores `(AI + REFINED) / total × 100`, and
+   rebuilds the original text as colour-coded `<span>`s.
 
 | Class | Colour | Meaning |
 |---|---|---|
@@ -71,60 +68,139 @@ Environment variables (or `.env`): `OPENROUTER_API_KEY`, `GROQ_API_KEY`,
 | `REFINED` | `#F59E0B` amber | Paraphrased / polished over an AI base |
 | `HUMAN` | `#3B82F6` blue | Organic variance, idiom, imperfection |
 
+**Humanize**
+1. Uses the labels from the last check (or labels the text in quick mode).
+2. Rewrites only `AI` / `REFINED` sentences, each sent with one neighbour on
+   either side as read-only context; the model returns only the rewritten
+   sentences, keyed by number.
+3. Swaps them back into the original, keeping spacing and paragraphs.
+4. Re-scores only the rewritten sentences and shows *before → after*.
+   *Extra polish* rewrites anything still flagged once more.
+
+Tones: natural, casual, academic, professional. Rewrites are cached per
+sentence + tone + model, so repeats cost nothing.
+
+Both features are limited to **2,500 words** per request (`MAX_WORDS` in
+`glitch/config.py`); the UI warns live and the server enforces it.
+
 ---
 
 ## Architecture
 
 ```
 browser (static/app.js)
-   │  POST /api/analyze  { text, provider, model, api_keys?, chunk_words,
-   │                       concurrency, fallback, cross_provider }
+   │  /api/analyze · /api/humanize · /api/models · /api/keys/identify
    ▼
-glitch/web.py ── local-only guard, validation, key resolution (.env / user), CSP
+glitch/web.py ─ local-only guard, validation, word limit, CSP, admin API
    │
-   ▼
-glitch/analyzer.py ── chunk → parallel workers ─┬─ ModelRouter (fallback + cooldowns)
-   │                                            └─ client.py → parsing.py
-   ▼
-score → text.py highlight HTML
+   ├─ analyzer.py ─┐   (detection: jobs + caches)
+   ├─ humanize.py ─┤   (rewrite: jobs + caches)
+   │               ▼
+   │          routing.py ─ jobs → parallel runner → ModelRouter
+   │               │       (balancing · fallback · cooldowns · budgets)
+   │               ▼
+   │          client.py ─ pooled HTTP, retries, error mapping
    │
-   ├── https://openrouter.ai/api/v1/chat/completions
-   └── https://api.groq.com/openai/v1/chat/completions
+   └─ keys.py ─ recognise key → provider · KeyStore (.env + instance/keys.json)
+                     │
+                providers.py ─ data-only registry of OpenAI-compatible providers
 ```
 
 | File | Role |
 |---|---|
 | `app.py` | Launcher: banner, free-port search, `app.run` |
-| `glitch/config.py` | `.env` loading, endpoints, limits, key resolution |
-| `glitch/providers.py` | Provider registry, free-model lists, model/key validation |
-| `glitch/catalogue.py` | Free-model listing, ranking, fallback order |
+| `glitch/config.py` | `.env` loading, limits, paths, admin token |
+| `glitch/providers.py` | Provider registry: URLs, key patterns, billing, model rules |
+| `glitch/keys.py` | Key recognition, verification, server key store |
+| `glitch/catalogue.py` | Model listing and ranking, fallback order, reasoning options |
+| `glitch/routing.py` | Shared job runner: balancing, fallback, cooldowns |
 | `glitch/client.py` | Pooled HTTP session, retries, upstream error mapping |
-| `glitch/prompt.py` | The verbatim system prompt and per-chunk message |
-| `glitch/parsing.py` | Tolerant JSON extraction, label normalisation |
-| `glitch/text.py` | Sentence splitting, chunking, highlight HTML |
-| `glitch/analyzer.py` | Parallel scan, model fallback and cooldowns, scoring |
-| `glitch/humanize.py` | Placeholder for the upcoming rewrite feature |
+| `glitch/cache.py` | Thread-safe TTL/LRU cache keyed by SHA-256 fingerprints |
+| `glitch/prompt.py` | Detection prompts (quick + verbatim classic) and rewrite prompt |
+| `glitch/parsing.py` | Tolerant parsers for labels, sentences, and rewrites |
+| `glitch/text.py` | Sentence splitting, chunking, highlight HTML, sentence replacement |
+| `glitch/analyzer.py` | Detection: jobs, sentence/section caches, scoring |
+| `glitch/humanize.py` | Rewrite: targets, context, caching, re-scoring, second pass |
 | `glitch/web.py` | Flask app factory and routes |
-| `templates/index.html` | Sidebar app: Check text, Humanize (preview), Settings, Account |
+| `templates/index.html` | Sidebar app: Check text, Humanize, Settings, Account |
 | `static/style.css` | Design tokens, highlight classes, layout |
-| `static/app.js` | Page routing, settings/keys, checks, plain-language results and errors, report download |
-| `tests/test_glitch.py` | Unit tests: parsing, fallback, keys, web guard, error mapping |
-| `tests/stub_provider.py` | Local provider double for the E2E check (can simulate 429s) |
+| `static/app.js` | Routing, settings/keys, checks, rewrites, plain-language errors |
+| `tests/test_glitch.py` | Unit tests (offline: network is blocked in tests) |
+| `tests/stub_provider.py` | Local provider double for E2E checks (labels, rewrites, 429s) |
 
 ### Parsing ladder
 
-The free model is instructed to return raw JSON, but it frequently does not.
-`parse_analysis()` degrades in four stages:
+Free models are told to return raw JSON but often don't. Every parser degrades
+the same way:
 
 1. `json.loads` on the outermost `{…}` (after stripping ```` ```json ```` fences).
 2. Trailing-comma repair, then parse again.
-3. Structural regex over `{"text": …, "classification": …}` objects, in either
-   key order — survives truncation and prose wrappers.
-4. Fail with a diagnostic containing the first 280 characters of the response.
+3. Structural regex — survives truncation and prose wrappers.
+4. Fail with a diagnostic containing the first 280 characters of the response
+   (the router then tries the next model).
 
 Labels are normalised (`paraphrased`, `machine-generated`, `polished` → the three
-canonical classes). Unknown labels default to `HUMAN` and raise a warning rather
-than inflating the AI score.
+canonical classes). Unknown labels default to `HUMAN` with a warning.
+
+---
+
+## Providers and keys
+
+Every provider speaks the OpenAI-compatible chat API, so each one is a data
+entry in `glitch/providers.py`:
+
+| Provider | Key format | Billing | Models allowed |
+|---|---|---|---|
+| OpenRouter | `sk-or-…` | free | `:free` models only |
+| Groq | `gsk_…` | free | documented Free Plan list |
+| Google Gemini | `AIza…` | free tier | anything its `/models` lists |
+| Cerebras | `csk-…` | free tier | 〃 |
+| Mistral | 32 letters/digits | free tier | 〃 |
+| OpenAI | `sk-proj-…`, `sk-…` | paid | 〃 |
+| DeepSeek | `sk-` + 32 hex | paid | 〃 |
+| xAI | `xai-…` | paid | 〃 |
+| Together AI | `tgp_v1_…`, 64 hex | paid | 〃 |
+
+**How a key is resolved** (`glitch/keys.py`):
+
+1. *Recognise* — match the key against each provider's `key_patterns`.
+2. *Confirm* — call that provider's `/models` with the key. A key is only ever
+   sent to providers whose pattern it matches, never to the others.
+3. If the provider can't be reached and the format is unambiguous, the key is
+   accepted unverified.
+
+**Server keys**, highest priority first: keys added at runtime (admin API,
+stored in `instance/keys.json` with `0600` permissions, git-ignored) →
+provider variables (`GROQ_API_KEY`, …) → `LLM_API_KEYS`. A user's own key from
+Settings overrides the server key for that user only.
+
+For generic providers the model list comes from the provider and is ranked for
+this task (fast instruction models first; embedding/audio/image/moderation
+models removed). Fallback **never moves work onto a paid provider** the user
+didn't select.
+
+**Adding a provider**: append a `ProviderSpec` with its base URL, key regexes,
+env var names, billing, and (optionally) curated models and reasoning-model
+patterns. Nothing else changes.
+
+### Admin API (for a future dashboard)
+
+Disabled unless `ADMIN_TOKEN` is set; every call needs
+`Authorization: Bearer $ADMIN_TOKEN`. Building the dashboard? Start with
+[docs/ADMIN_DASHBOARD.md](docs/ADMIN_DASHBOARD.md).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/admin/keys` | All keys (masked) with source, plus provider readiness |
+| `POST` | `/api/admin/keys` | `{key, label?}` → recognised, verified, stored; `201` |
+| `DELETE` | `/api/admin/keys/<id>` | Remove a stored key (env keys are read-only) |
+
+```bash
+curl -s -X POST http://127.0.0.1:8501/api/admin/keys \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"key":"AIza…","label":"team Gemini"}'
+# → {"ok":true,"key":{"provider":"gemini","key":"AIza…abcd","verified":true,…}}
+```
 
 ---
 
@@ -132,50 +208,40 @@ than inflating the AI score.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | Dashboard |
-| `GET` | `/api/health` | Node status, providers, defaults |
-| `POST` | `/api/models` | `{provider, api_keys?, force?}` → ranked free-model list |
-| `POST` | `/api/analyze` | `{text, provider, model, api_keys?, chunk_words?, concurrency?, fallback?, cross_provider?, compact?, balance?}` → score + sentences + HTML |
-| `POST` | `/api/humanize` | Placeholder — returns `501` |
+| `GET` | `/` | App |
+| `GET` | `/api/health` · `/api/providers` | Providers and whether each is ready (never keys) |
+| `POST` | `/api/keys/identify` | `{key}` → `{provider, label, verified}`; nothing stored |
+| `POST` | `/api/models` | `{provider, api_keys?, force?}` → ranked model list |
+| `POST` | `/api/analyze` | `{text, provider, model, api_keys?, …options}` → score, sentences, HTML |
+| `POST` | `/api/humanize` | `{text, provider, model, api_keys?, tone?, only_flagged?, second_pass?, labels?, …options}` → rewritten text, HTML, changes, before/after score |
 
-`api_keys` is `{"openrouter": "…", "groq": "…"}`; omitted providers use the
-`.env` key. The legacy single `api_key` field is still accepted. Results include
-`model`/`provider` (the model that did most of the work), `requested_model`,
-`models_used`, and `fallbacks`.
-
-Model listing (OpenRouter needs no key; Groq needs the key to verify availability):
-
-```bash
-curl -s http://127.0.0.1:8501/api/models \
-  -H 'Content-Type: application/json' \
-  -d '{"provider":"groq"}'
-```
-
-Analysis:
+Options shared by analyze and humanize: `chunk_words`, `concurrency`,
+`fallback`, `cross_provider`, `compact`, `balance`. `api_keys` maps provider id
+to the user's own key; omitted providers use the server key. Results include
+`usage` (tokens), `models_used`, and `fallbacks`.
 
 ```bash
-curl -s http://127.0.0.1:8501/api/analyze \
-  -H 'Content-Type: application/json' \
-  -d '{"provider":"openrouter","model":"google/gemma-4-31b-it:free","text":"Your text here. Second sentence."}'
+curl -s http://127.0.0.1:8501/api/humanize -H 'Content-Type: application/json' \
+  -d '{"provider":"groq","model":"openai/gpt-oss-120b","tone":"casual","text":"…"}'
 ```
-
-Non-free models are rejected **before** any network call: OpenRouter IDs must end
-in `:free`, and Groq IDs must be on the documented Free Plan list.
 
 ---
 
 ## Security & privacy
 
-- `.env` keys are read by the server and **never sent to the browser**; the UI
-  only receives an "env key available" flag.
-- Custom keys from Settings live in the tab's memory and are sent to the local
-  node with each request. Optional "keep until this tab closes" uses
-  `sessionStorage`. Non-secret settings use `localStorage`.
+- Server keys (`.env`, admin store) are **never sent to the browser**; the UI
+  only learns whether a provider is ready. Admin listings show masked keys.
+- A pasted key is only sent to providers whose key format it matches.
+- User keys from Settings live in the tab's memory (optionally
+  `sessionStorage`) and are sent to the local node with each request.
+- The admin API is off unless `ADMIN_TOKEN` is set, and compares tokens in
+  constant time.
 - The server binds to `127.0.0.1` only and rejects requests whose `Host` is not
-  `127.0.0.1`/`localhost` (blocks DNS-rebinding pages from spending `.env` keys).
+  `127.0.0.1`/`localhost` (blocks DNS-rebinding pages from spending server keys).
   It sets `Cache-Control: no-store`, `X-Frame-Options: DENY`, and a strict CSP.
-- Model output is HTML-escaped before it is wrapped in highlight spans, so a
-  document containing `<script>` cannot inject markup.
+- Model output is HTML-escaped before it is wrapped in spans.
+- Caches hold SHA-256 fingerprints of text; client-supplied labels are never
+  written into the shared cache.
 - API keys are not logged; failures log only status codes and messages.
 
 ---
@@ -210,10 +276,10 @@ models, so long documents may pause on `429` retries.
 | **Quick (compact) mode** | Sentences are split locally and sent numbered; the model replies with labels only (`{"labels": [...]}`) instead of echoing the text. About 93% less output and about 50% fewer total tokens. | Advanced → Quick mode (default on). Off = the original verbatim prompt. |
 | **Sized `max_tokens`** | Each request asks only for what its reply needs (plus headroom for reasoning models), instead of a flat 4096. Groq counts the requested budget against tokens-per-minute. A cut-off reply is retried once with a larger budget. | Automatic |
 | **Low reasoning effort** | `reasoning_effort: "low"` for gpt-oss on Groq; `reasoning.effort: "low"` for OpenRouter models that advertise reasoning. Dropped automatically if a provider rejects it. | Automatic |
-| **Result cache** | Each section's result is cached in memory (1 h, 512 entries) by text, model, mode, and prompt version. Re-checking unchanged text costs nothing. | Automatic |
+| **Edit-aware cache** | In quick mode every sentence's label is cached (in memory, 6 h) under the selected service + model. A re-check sends only new or edited sentences, duplicates once; an unchanged document makes no calls at all. Labels are saved as each group finishes, so a scan interrupted by limits resumes where it stopped. Classic mode caches whole sections. Only SHA-256 fingerprints of text are kept. | Automatic |
 | **Load balancing** | Sections of a long document are spread round-robin over the provider's top free models (Groq: 3, OpenRouter: 2), multiplying per-model rate-limit budgets. | Advanced → Share long documents across models (default on) |
 
-Each result reports `mode`, `cached_chunks`, `usage` (prompt / completion /
+Each result reports `mode`, `reused_sentences`, `cached_chunks`, `usage` (prompt / completion /
 total tokens), and `models_used`; the server log prints them per scan.
 
 ### Rate limits and fallback
@@ -289,3 +355,11 @@ A detector score is evidence about statistical typicality, **not proof of
 authorship**. False positives concentrate on second-language writers, formulaic
 genres (lab reports, legal boilerplate), and heavily edited drafts. The UI states
 this explicitly; keep it that way in any deployment.
+
+---
+
+## Business model
+
+See [BUSINESS_MODEL.md](BUSINESS_MODEL.md) for the commercial model: Free and
+Premium limits, MWK pricing, PayChangu payments (Airtel Money, TNM Mpamba,
+bank/card), family plans, renewal notifications, unit economics and projections.

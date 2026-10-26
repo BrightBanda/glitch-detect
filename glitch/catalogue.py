@@ -1,7 +1,13 @@
-"""Free-model catalogue: listing, ranking, and fallback order."""
+"""Model catalogue: listing, ranking, fallback order, per-model request options.
+
+OpenRouter and Groq have dedicated rules (free models only). Every other
+provider is listed from its own ``/models`` endpoint, filtered to chat models,
+and ranked for this job: fast, instruction-following models first.
+"""
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -15,6 +21,7 @@ from .providers import (
     GROQ_FREE_SPECIALIZED,
     OPENROUTER_RECOMMENDED,
     OPENROUTER_SPECIALIZED,
+    PAID,
     PROVIDERS,
     get_provider,
 )
@@ -24,15 +31,24 @@ GROUP_ORDER = ("recommended", "specialized", "general")
 GROUP_LABELS = {
     "recommended": "RECOMMENDED — BEST FOR SENTENCE JSON",
     "specialized": "SPECIALIZED CLASSIFIERS — EXPERIMENTAL",
-    "general": "OTHER FREE MODELS",
+    "general": "OTHER MODELS",
 }
+
+# Models that cannot do chat-style text classification.
+_NON_CHAT = re.compile(
+    r"embed|whisper|tts|audio|speech|transcri|image|dall-e|imagen|veo|vision-preview|"
+    r"moderation|guard|rerank|realtime|search|aqa|learnlm|ocr|codestral-mamba",
+    re.IGNORECASE,
+)
+# Ranking hints for generic providers: fast instruction models suit this job.
+_PREFER = re.compile(r"flash|mini|lite|small|instant|instruct|turbo|haiku|chat", re.IGNORECASE)
+_AVOID = re.compile(
+    r"preview|exp|thinking|reasoner|large|pro\b|opus|405b|deep-research|code", re.IGNORECASE
+)
 
 _CACHE_TTL = 600
 _cache_lock = threading.Lock()
-_MODEL_CACHE: dict = {
-    "openrouter": {"at": 0.0, "payload": None},
-    "groq": {"at": 0.0, "payload": None},
-}
+_MODEL_CACHE: dict[str, dict] = {pid: {"at": 0.0, "payload": None} for pid in PROVIDERS}
 
 
 def _entry(
@@ -122,12 +138,9 @@ def openrouter_models(items) -> list[dict]:
     return _sort_models(models, list(OPENROUTER_RECOMMENDED))
 
 
-def _groq_reasons(model_id: str) -> bool:
-    return model_id.startswith(("openai/gpt-oss", "qwen/qwen3"))
-
-
 def groq_entries(live_items=None) -> list[dict]:
     """Groq free-plan entries; live_items=None returns the curated fallback."""
+    spec = PROVIDERS["groq"]
     live = {}
     for item in live_items or []:
         if isinstance(item, dict) and item.get("id"):
@@ -147,23 +160,50 @@ def groq_entries(live_items=None) -> list[dict]:
                 group,
                 note,
                 json_capable=group == "recommended",
-                reasoning=_groq_reasons(model_id),
+                reasoning=bool(re.search(spec.reasoning_models, model_id)),
             )
         )
     priority = list(GROQ_FREE_CHAT) + list(GROQ_FREE_SPECIALIZED)
     return _sort_models(models, priority)
 
 
-def _groq_fallback(note: str) -> dict:
-    models = groq_entries()
-    return {
-        "provider": "groq",
-        "label": "Groq",
-        "models": models,
-        "default": models[0]["id"] if models else PROVIDERS["groq"]["default_model"],
-        "source": "fallback",
-        "note": note,
-    }
+def generic_models(provider: str, items) -> list[dict]:
+    """Chat models from any OpenAI-compatible ``/models`` list, ranked for this task."""
+    spec = get_provider(provider)
+    seen, scored = set(), []
+    for item in items or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        model_id = str(item["id"]).removeprefix("models/")
+        if model_id in seen or _NON_CHAT.search(model_id):
+            continue
+        seen.add(model_id)
+        curated = list(spec.allowlist).index(model_id) if model_id in spec.allowlist else None
+        score = (
+            0 if curated is not None else 1,
+            curated or 0,
+            0 if _PREFER.search(model_id) else 1,
+            1 if _AVOID.search(model_id) else 0,
+            model_id,
+        )
+        scored.append((score, model_id, item))
+    scored.sort()
+
+    models = []
+    for rank, (_, model_id, item) in enumerate(scored):
+        group = "recommended" if rank < 3 else "general"
+        models.append(
+            _entry(
+                model_id,
+                str(item.get("name") or item.get("display_name") or model_id),
+                item.get("context_length") or item.get("context_window"),
+                group,
+                spec.allowlist.get(model_id, ""),
+                json_capable=True,
+                reasoning=bool(spec.reasoning_models and re.search(spec.reasoning_models, model_id)),
+            )
+        )
+    return models
 
 
 def _remember(provider: str, result: dict) -> dict:
@@ -172,31 +212,36 @@ def _remember(provider: str, result: dict) -> dict:
     return result
 
 
+def _result(provider: str, models: list[dict], source: str, note: str) -> dict:
+    spec = get_provider(provider)
+    return {
+        "provider": spec.id,
+        "label": spec.label,
+        "billing": spec.billing,
+        "models": models,
+        "default": models[0]["id"] if models else spec.default_model,
+        "source": source,
+        "note": note,
+    }
+
+
+def _groq_fallback(note: str) -> dict:
+    return _result("groq", groq_entries(), "fallback", note)
+
+
 def list_models(provider: str, api_key: str = "", force: bool = False) -> dict:
-    """Return only free-tier models, ranked for sentence-JSON classification.
+    """Allowed models for a provider, ranked for sentence-JSON classification."""
+    spec = get_provider(provider)
+    cached = _MODEL_CACHE[spec.id]
 
-    OpenRouter exposes a public catalogue and marks free models with ``:free``.
-    Groq requires a key and does not flag plan eligibility in its API, so the
-    documented Free Plan set is used and intersected with the live catalogue.
-    """
-    cfg = get_provider(provider)
-    key = cfg["key"]
-    cached = _MODEL_CACHE[key]
-
-    if key == "openrouter":
-        if (
-            not force
-            and cached["payload"]
-            and time.monotonic() - cached["at"] < _CACHE_TTL
-        ):
+    if spec.id == "openrouter":
+        if not force and cached["payload"] and time.monotonic() - cached["at"] < _CACHE_TTL:
             return cached["payload"]
         try:
-            response = client.get(f"{cfg['base_url']}/models", timeout=8)
+            response = client.get(f"{spec.base_url}/models", timeout=8)
             response.raise_for_status()
             payload = response.json()
-            models = openrouter_models(
-                payload.get("data") if isinstance(payload, dict) else []
-            )
+            models = openrouter_models(payload.get("data") if isinstance(payload, dict) else [])
         except Exception as exc:
             if cached["payload"]:
                 return {**cached["payload"], "source": "cached"}
@@ -205,105 +250,104 @@ def list_models(provider: str, api_key: str = "", force: bool = False) -> dict:
                 status=502,
                 detail=str(exc)[:300],
             ) from exc
-
         return _remember(
-            key,
-            {
-                "provider": "openrouter",
-                "label": "OpenRouter",
-                "models": models,
-                "default": models[0]["id"] if models else DEFAULT_MODEL,
-                "source": "live",
-                "note": "Only :free models · ranked by JSON task fit.",
-            },
+            spec.id, _result(spec.id, models, "live", "Only :free models · ranked by JSON task fit.")
         )
 
-    # Groq: the model list is account-scoped and key-protected.
+    if spec.id == "groq" and (not api_key or len(api_key.strip()) < 12):
+        return _groq_fallback("Groq Free Plan models. Add a key in Settings to verify availability.")
     if not api_key or len(api_key.strip()) < 12:
-        return _groq_fallback(
-            "Groq Free Plan models. Add a key in Settings to verify availability."
-        )
+        raise DetectorError(f"Add a {spec.label} key to see its models.", status=400)
 
-    # Not served from cache: the listing re-validates the key and plan.
+    if not force and cached["payload"] and time.monotonic() - cached["at"] < _CACHE_TTL:
+        return cached["payload"]
+
     try:
         response = client.get(
-            f"{cfg['base_url']}/models", api_key=api_key, provider="groq", timeout=10
+            f"{spec.base_url}/models", api_key=api_key, provider=spec.id, timeout=10
         )
     except requests.RequestException as exc:
-        return _groq_fallback(
-            f"Could not reach Groq ({str(exc)[:80]}). Showing the documented Free Plan list."
-        )
+        if spec.id == "groq":
+            return _groq_fallback(
+                f"Could not reach Groq ({str(exc)[:80]}). Showing the documented Free Plan list."
+            )
+        raise DetectorError(f"Could not reach {spec.label}.", status=502, detail=str(exc)[:300]) from exc
 
     if response.status_code in (401, 403):
         raise DetectorError(
-            "Groq rejected the API key. Check it in Settings.",
+            f"{spec.label} rejected the API key. Check it in Settings.",
             status=401,
             detail=client.upstream_detail(response),
         )
-
     if response.status_code != 200:
-        return _groq_fallback(
-            f"Groq returned HTTP {response.status_code}. Showing the documented Free Plan list."
-        )
+        if spec.id == "groq":
+            return _groq_fallback(
+                f"Groq returned HTTP {response.status_code}. Showing the documented Free Plan list."
+            )
+        raise DetectorError(f"{spec.label} returned HTTP {response.status_code}.", status=502)
 
     try:
         payload = response.json()
     except ValueError:
-        return _groq_fallback("Groq returned a non-JSON model list.")
+        if spec.id == "groq":
+            return _groq_fallback("Groq returned a non-JSON model list.")
+        raise DetectorError(f"{spec.label} returned an unreadable model list.", status=502)
 
-    models = groq_entries(payload.get("data") if isinstance(payload, dict) else [])
-    if not models:
-        return _groq_fallback(
-            "None of the documented Free Plan models were returned by Groq. "
-            "The plan may have changed."
+    items = payload.get("data") if isinstance(payload, dict) else []
+    if spec.id == "groq":
+        models = groq_entries(items)
+        if not models:
+            return _groq_fallback(
+                "None of the documented Free Plan models were returned by Groq. "
+                "The plan may have changed."
+            )
+        return _remember(
+            spec.id, _result(spec.id, models, "live", "Only Groq Free Plan text models · 8K TPM, 1K RPD.")
         )
 
-    return _remember(
-        key,
-        {
-            "provider": "groq",
-            "label": "Groq",
-            "models": models,
-            "default": models[0]["id"],
-            "source": "live",
-            "note": "Only Groq Free Plan text models · 8K TPM, 1K RPD.",
-        },
-    )
+    models = generic_models(spec.id, items)
+    note = "Billed to the key owner." if spec.billing == PAID else "Uses this key's free allowance."
+    return _remember(spec.id, _result(spec.id, models, "live", note))
 
 
-def fallback_models(provider: str, limit: int = 4) -> list[str]:
+def fallback_models(provider: str, api_key: str = "", limit: int = 4) -> list[str]:
     """Models worth switching to when the selected one fails, best first.
 
     Safety/guardrail classifiers are never used as fallbacks: they tend to
     answer with their own labels instead of the sentence schema.
     """
-    key = get_provider(provider)["key"]
-    if key == "groq":
-        payload = _MODEL_CACHE["groq"]["payload"]
-        models = payload["models"] if payload else groq_entries()
-    else:
+    spec = get_provider(provider)
+    payload = _MODEL_CACHE[spec.id]["payload"]
+    if payload:
+        models = payload["models"]
+    elif spec.id == "groq":
+        models = groq_entries()
+    elif spec.id == "openrouter":
         try:
             models = list_models("openrouter")["models"]
         except DetectorError:
             models = [_entry(m, m, 0, "recommended", "") for m in OPENROUTER_RECOMMENDED]
+    elif api_key:
+        try:
+            models = list_models(spec.id, api_key)["models"]
+        except DetectorError:
+            models = []
+    else:
+        models = []
 
     ranked = [m["id"] for m in models if m["group"] == "recommended"]
-    ranked += [
-        m["id"] for m in models if m["group"] == "general" and m["json_capable"]
-    ]
+    ranked += [m["id"] for m in models if m["group"] == "general" and m["json_capable"]]
     return ranked[:limit]
 
 
 def is_reasoning(provider: str, model: str) -> bool:
     """Whether the model spends hidden reasoning tokens before answering."""
-    key = get_provider(provider)["key"]
-    if key == "groq":
-        return _groq_reasons(model)
-    payload = _MODEL_CACHE["openrouter"]["payload"]
+    spec = get_provider(provider)
+    payload = _MODEL_CACHE[spec.id]["payload"]
     for entry in (payload or {}).get("models", []):
         if entry["id"] == model:
             return entry.get("reasoning", False)
-    return False
+    return bool(spec.reasoning_models and re.search(spec.reasoning_models, model))
 
 
 def request_options(provider: str, model: str) -> dict:
@@ -312,9 +356,9 @@ def request_options(provider: str, model: str) -> dict:
     Only sent where the model is known to support them; the client drops
     them and retries if a provider still rejects the request (HTTP 400).
     """
-    key = get_provider(provider)["key"]
-    if key == "groq" and model.startswith("openai/gpt-oss"):
+    spec = get_provider(provider)
+    if spec.id == "openrouter":
+        return {"reasoning": {"effort": "low", "exclude": True}} if is_reasoning(spec.id, model) else {}
+    if spec.low_effort_models and re.search(spec.low_effort_models, model):
         return {"reasoning_effort": "low"}
-    if key == "openrouter" and is_reasoning(key, model):
-        return {"reasoning": {"effort": "low", "exclude": True}}
     return {}

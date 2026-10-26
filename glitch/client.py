@@ -34,9 +34,7 @@ def headers(api_key: str, provider: str) -> dict:
         "Authorization": f"Bearer {api_key.strip()}",
         "Content-Type": "application/json",
     }
-    if get_provider(provider)["key"] == "openrouter":
-        out["HTTP-Referer"] = config.APP_URL
-        out["X-Title"] = config.APP_TITLE
+    out.update(get_provider(provider).extra_headers)
     return out
 
 
@@ -80,6 +78,7 @@ def post_chat(
     deadline: float | None = None,
     max_tokens: int = MAX_OUTPUT_TOKENS,
     options: dict | None = None,
+    temperature: float = 0.0,
 ):
     """POST a chat completion and return the HTTP response (status 200).
 
@@ -89,12 +88,12 @@ def post_chat(
     with HTTP 400 they are dropped and the call is retried once without them.
     """
     cfg = get_provider(provider)
-    label = cfg["label"]
-    url = f"{cfg['base_url']}/chat/completions"
+    label = cfg.label
+    url = f"{cfg.base_url}/chat/completions"
     base_payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.0,
+        "temperature": temperature,
         "top_p": 1.0,
         "max_tokens": max(16, min(int(max_tokens), MAX_OUTPUT_TOKENS)),
     }
@@ -123,7 +122,7 @@ def post_chat(
         try:
             response = _session.post(
                 url,
-                headers=headers(api_key, cfg["key"]),
+                headers=headers(api_key, cfg.id),
                 json=payload,
                 timeout=(10, read_timeout),
             )
@@ -230,13 +229,13 @@ def request_chunk(
     cfg = get_provider(provider)
     while True:
         response = post_chat(
-            messages, api_key, model, cfg["key"], max_tokens=max_tokens, **kwargs
+            messages, api_key, model, cfg.id, max_tokens=max_tokens, **kwargs
         )
         try:
             data = response.json()
         except ValueError as exc:
             raise ModelFailure(
-                f"{cfg['label']} returned a non-JSON envelope.",
+                f"{cfg.label} returned a non-JSON envelope.",
                 status=502,
                 detail=str(exc),
             ) from exc
@@ -258,7 +257,7 @@ def request_chunk(
 
     if not choices:
         raise ModelFailure(
-            f"{cfg['label']} returned no choices.",
+            f"{cfg.label} returned no choices.",
             status=502,
             detail=str(data)[:300],
         )

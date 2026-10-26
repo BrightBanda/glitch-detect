@@ -3,17 +3,12 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
+  const body = document.body.dataset;
   const MIN_KEY = 12;
   const UI_TIMEOUT_MS = 240000;
-  const MIN_CHARS = Number($("text").dataset.minChars) || 80;
+  const MIN_CHARS = Number(body.minChars) || 80;
+  const MAX_WORDS = Number(body.maxWords) || 2500;
   const VIEWS = ["check", "humanize", "settings", "account"];
-
-  /* Provider metadata rendered by the server (labels, defaults, key readiness). */
-  const PROVIDER_META = {};
-  document.querySelectorAll("#providerData [data-provider]").forEach((el) => {
-    PROVIDER_META[el.dataset.provider] = { ...el.dataset, ready: Boolean(el.dataset.ready) };
-  });
-  const PROVIDERS = Object.keys(PROVIDER_META);
 
   const els = {
     views: Array.from(document.querySelectorAll(".view")),
@@ -25,19 +20,13 @@
     // check
     text: $("text"),
     textStats: $("textStats"),
+    limitNote: $("limitNote"),
     analyzeBtn: $("analyzeBtn"),
     sampleBtn: $("sampleBtn"),
     clearBtn: $("clearBtn"),
     progressNote: $("progressNote"),
     editorPanel: $("editorPanel"),
-    dots: $("dots"),
     alert: $("alert"),
-    alertTitle: $("alertTitle"),
-    alertMessage: $("alertMessage"),
-    alertAction: $("alertAction"),
-    alertDetailWrap: $("alertDetailWrap"),
-    alertDetail: $("alertDetail"),
-    alertClose: $("alertClose"),
     results: $("results"),
     emptyState: $("emptyState"),
     scoreboard: $("scoreboard"),
@@ -51,9 +40,30 @@
     notice: $("notice"),
     doc: $("doc"),
     showTags: $("showTags"),
+    humanizeFlagged: $("humanizeFlagged"),
     downloadBtn: $("downloadBtn"),
+    // humanize
+    humanizePanel: $("humanizePanel"),
+    humanizeInput: $("humanizeInput"),
+    humanizeStats: $("humanizeStats"),
+    humanizeLimitNote: $("humanizeLimitNote"),
+    useLastCheck: $("useLastCheck"),
+    humanizeTone: $("humanizeTone"),
+    onlyFlagged: $("onlyFlagged"),
+    secondPass: $("secondPass"),
+    humanizeBtn: $("humanizeBtn"),
+    hAlert: $("hAlert"),
+    humanizeResult: $("humanizeResult"),
+    scoreShift: $("scoreShift"),
+    shiftFrom: $("shiftFrom"),
+    shiftTo: $("shiftTo"),
+    rewriteNote: $("rewriteNote"),
+    humanizeOutput: $("humanizeOutput"),
+    copyRewrite: $("copyRewrite"),
+    checkRewrite: $("checkRewrite"),
     // settings
-    providerChoices: Array.from(document.querySelectorAll("[data-provider-choice]")),
+    providerChoices: $("providerChoices"),
+    noProviders: $("noProviders"),
     model: $("model"),
     modelHint: $("modelHint"),
     refreshModels: $("refreshModels"),
@@ -61,6 +71,11 @@
     optCrossProvider: $("optCrossProvider"),
     optCompact: $("optCompact"),
     optBalance: $("optBalance"),
+    newKey: $("newKey"),
+    toggleNewKey: $("toggleNewKey"),
+    addKey: $("addKey"),
+    keyFeedback: $("keyFeedback"),
+    keyList: $("keyList"),
     rememberKeys: $("rememberKeys"),
     chunkWords: $("chunkWords"),
     concurrency: $("concurrency"),
@@ -74,7 +89,7 @@
   };
 
   const DEFAULT_SETTINGS = {
-    provider: PROVIDERS[0] || "openrouter",
+    provider: body.defaultProvider || "openrouter",
     models: {},
     fallback: true,
     crossProvider: true,
@@ -83,16 +98,18 @@
     compact: true,
     balance: true,
     rememberKeys: false,
+    tone: "natural",
   };
 
   const state = {
+    providers: {}, // id -> {id, label, billing, keys_url, default_model, ready}
     settings: { ...DEFAULT_SETTINGS },
-    keys: Object.fromEntries(PROVIDERS.map((p) => [p, ""])),
+    keys: {}, // provider id -> the user's own key
     profile: { name: "", scans: 0, words: 0, last: 0 },
     analysis: null,
+    lastCheck: null, // {text, sentences} from the most recent check
+    rewrite: null,
     busy: false,
-    dotTimer: null,
-    noteTimer: null,
     keyTimer: null,
     modelsRequest: 0,
   };
@@ -128,113 +145,267 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     },
   };
 
-  function readJson(key, fallback) {
+  function readJson(area, key, fallback) {
     try {
-      return { ...fallback, ...JSON.parse(store.get("localStorage", key) || "{}") };
+      return { ...fallback, ...JSON.parse(store.get(area, key) || "{}") };
     } catch {
       return { ...fallback };
     }
   }
 
   function load() {
-    state.settings = readJson("glitch_settings", DEFAULT_SETTINGS);
-    if (!PROVIDERS.includes(state.settings.provider)) state.settings.provider = DEFAULT_SETTINGS.provider;
-    state.profile = readJson("glitch_profile", state.profile);
-    if (state.settings.rememberKeys) {
-      for (const p of PROVIDERS) state.keys[p] = store.get("sessionStorage", `glitch_key_${p}`) || "";
-    }
+    state.settings = readJson("localStorage", "glitch_settings", DEFAULT_SETTINGS);
+    state.profile = readJson("localStorage", "glitch_profile", state.profile);
+    if (state.settings.rememberKeys) state.keys = readJson("sessionStorage", "glitch_keys", {});
   }
 
   const saveSettings = () => store.set("localStorage", "glitch_settings", JSON.stringify(state.settings));
   const saveProfile = () => store.set("localStorage", "glitch_profile", JSON.stringify(state.profile));
 
   function persistKeys() {
-    for (const p of PROVIDERS) {
-      const key = state.keys[p].trim();
-      if (state.settings.rememberKeys && key) store.set("sessionStorage", `glitch_key_${p}`, key);
-      else store.remove("sessionStorage", `glitch_key_${p}`);
+    if (state.settings.rememberKeys && Object.keys(state.keys).length) {
+      store.set("sessionStorage", "glitch_keys", JSON.stringify(state.keys));
+    } else {
+      store.remove("sessionStorage", "glitch_keys");
     }
   }
 
-  /* ─────────────────────────── keys ─────────────────────────── */
+  /* ─────────────────────────── utilities ─────────────────────────── */
+  const countWords = (value) => (value.trim() ? value.trim().split(/\s+/).length : 0);
+  const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+
+  async function postJson(url, payload, { timeout = UI_TIMEOUT_MS } = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      const data = await res.json().catch(() => null);
+      return { res, data };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /* ─────────────────────────── keys + providers ─────────────────────────── */
   const userKey = (p) => (state.keys[p] || "").trim();
 
-  /** "custom" (user's key) | "ready" (set up on this computer) | "missing" */
+  /** "custom" (user's key) | "ready" (set up on the server) | "missing" */
   function keySource(p) {
     if (userKey(p).length >= MIN_KEY) return "custom";
-    if (PROVIDER_META[p]?.ready) return "ready";
+    if (state.providers[p]?.ready) return "ready";
     return "missing";
   }
 
-  /** Only keys the user typed are sent; built-in keys never leave the server. */
+  const availableProviders = () => Object.keys(state.providers).filter((p) => keySource(p) !== "missing");
+
+  /** Only keys the user added travel with requests; server keys never leave it. */
   function customKeys() {
     const out = {};
-    for (const p of PROVIDERS) if (keySource(p) === "custom") out[p] = userKey(p);
+    for (const p of Object.keys(state.keys)) if (keySource(p) === "custom") out[p] = userKey(p);
     return out;
   }
 
-  const currentModel = () => state.settings.models[state.settings.provider] || PROVIDER_META[state.settings.provider].defaultModel;
+  function routingOptions() {
+    const s = state.settings;
+    return {
+      provider: s.provider,
+      model: currentModel(),
+      api_keys: customKeys(),
+      chunk_words: s.chunkWords,
+      concurrency: s.concurrency,
+      fallback: s.fallback,
+      cross_provider: s.crossProvider,
+      compact: s.compact,
+      balance: s.balance,
+    };
+  }
 
-  /* ─────────────────────────── navigation ─────────────────────────── */
-  function showView(name) {
-    const view = VIEWS.includes(name) ? name : "check";
-    els.views.forEach((v) => (v.hidden = v.dataset.view !== view));
-    els.navLinks.forEach((link) => {
-      const active = link.dataset.view === view;
-      link.classList.toggle("active", active);
-      if (active) link.setAttribute("aria-current", "page");
-      else link.removeAttribute("aria-current");
-    });
-    if (view === "account") renderProfile();
-    window.scrollTo(0, 0);
+  function currentModel() {
+    const p = state.settings.provider;
+    return state.settings.models[p] || state.providers[p]?.default_model || body.defaultModel || "";
+  }
+
+  async function loadProviders() {
+    try {
+      const res = await fetch("/api/providers", { cache: "no-store" });
+      const data = await res.json();
+      state.providers = Object.fromEntries((data.providers || []).map((p) => [p.id, p]));
+      els.nodeStatus.dataset.state = "online";
+      els.nodeLabel.textContent = "Ready";
+    } catch {
+      els.nodeStatus.dataset.state = "offline";
+      els.nodeLabel.textContent = "Offline";
+      return;
+    }
+    ensureProvider();
+    renderProviders();
+    renderKeys();
+    loadModels();
+  }
+
+  /** Keep the selected service usable: fall back to the first available one. */
+  function ensureProvider() {
+    const available = availableProviders();
+    if (!available.includes(state.settings.provider) && available.length) {
+      state.settings.provider = available[0];
+      saveSettings();
+    }
+  }
+
+  const BILLING_NOTE = {
+    free: "Free models only.",
+    "free-tier": "Uses this key's free allowance.",
+    paid: "Billed to the key's account.",
+  };
+
+  function renderProviders() {
+    const available = availableProviders();
+    els.providerChoices.replaceChildren(
+      ...available.map((id) => {
+        const p = state.providers[id];
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "choice";
+        btn.setAttribute("role", "radio");
+        btn.setAttribute("aria-checked", id === state.settings.provider ? "true" : "false");
+        const title = document.createElement("span");
+        title.className = "choice-title";
+        title.textContent = p.label;
+        const desc = document.createElement("span");
+        desc.className = "choice-desc";
+        desc.textContent = BILLING_NOTE[p.billing] || "";
+        const status = document.createElement("span");
+        status.className = "choice-status";
+        status.dataset.state = "ready";
+        status.textContent = keySource(id) === "custom" ? "✓ Using your key" : "✓ Ready to use";
+        btn.append(title, desc, status);
+        btn.addEventListener("click", () => setProvider(id));
+        return btn;
+      })
+    );
+    els.noProviders.hidden = available.length > 0;
+    els.setupDot.hidden = available.length > 0;
+  }
+
+  function renderKeys() {
+    const items = Object.keys(state.keys)
+      .filter((p) => userKey(p) && state.providers[p])
+      .map((p) => {
+        const li = document.createElement("li");
+        const name = document.createElement("span");
+        name.className = "key-provider";
+        name.textContent = state.providers[p].label;
+        const masked = document.createElement("span");
+        masked.className = "key-mask";
+        const key = userKey(p);
+        masked.textContent = `${key.slice(0, 4)}…${key.slice(-4)}`;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "mini-btn";
+        remove.textContent = "Remove";
+        remove.addEventListener("click", () => {
+          delete state.keys[p];
+          persistKeys();
+          afterKeysChanged();
+        });
+        li.append(name, masked, remove);
+        return li;
+      });
+    els.keyList.replaceChildren(...items);
+  }
+
+  function afterKeysChanged() {
+    ensureProvider();
+    renderProviders();
+    renderKeys();
+    loadModels();
+  }
+
+  function keyFeedback(message, tone) {
+    els.keyFeedback.textContent = message;
+    els.keyFeedback.dataset.state = tone;
+    els.keyFeedback.hidden = !message;
+  }
+
+  async function addKey() {
+    const key = els.newKey.value.trim();
+    if (!key) return;
+    els.addKey.disabled = true;
+    keyFeedback("Checking which service this key is for…", "info");
+    try {
+      const { res, data } = await postJson("/api/keys/identify", { key }, { timeout: 30000 });
+      if (!res.ok || !data || !data.ok) {
+        keyFeedback((data && data.error && data.error.message) || "That key couldn't be added.", "error");
+        return;
+      }
+      state.keys[data.provider] = key;
+      state.settings.provider = data.provider;
+      saveSettings();
+      persistKeys();
+      els.newKey.value = "";
+      keyFeedback(
+        data.verified ? `✓ ${data.label} key added and working.` : `✓ Recognised as a ${data.label} key.`,
+        "ok"
+      );
+      afterKeysChanged();
+    } catch {
+      keyFeedback("Couldn't reach the app to check the key.", "error");
+    } finally {
+      els.addKey.disabled = false;
+    }
   }
 
   /* ─────────────────────────── settings view ─────────────────────────── */
-  function refreshSetupState() {
-    const s = state.settings;
-    els.providerChoices.forEach((btn) => {
-      const p = btn.dataset.providerChoice;
-      btn.setAttribute("aria-checked", p === s.provider ? "true" : "false");
-      const status = btn.querySelector("[data-status]");
-      const source = keySource(p);
-      status.dataset.state = source === "missing" ? "needs-key" : "ready";
-      status.textContent =
-        source === "custom" ? "✓ Using your key" : source === "ready" ? "✓ Ready to use" : "Needs a key — add one below";
-    });
-    els.setupDot.hidden = keySource(s.provider) !== "missing";
-  }
-
   function fillSettings() {
     const s = state.settings;
     els.optFallback.checked = s.fallback;
     els.optCrossProvider.checked = s.crossProvider;
     els.optCrossProvider.disabled = !s.fallback;
-    els.rememberKeys.checked = s.rememberKeys;
     els.optCompact.checked = s.compact;
     els.optBalance.checked = s.balance;
+    els.rememberKeys.checked = s.rememberKeys;
     els.chunkWords.value = s.chunkWords;
     els.concurrency.value = String([0, 1, 4].includes(s.concurrency) ? s.concurrency : 0);
-    document.querySelectorAll("[data-key-input]").forEach((input) => {
-      input.value = state.keys[input.dataset.keyInput] || "";
+    els.humanizeTone.value = s.tone;
+  }
+
+  function readOptions() {
+    const words = Number(els.chunkWords.value);
+    Object.assign(state.settings, {
+      fallback: els.optFallback.checked,
+      crossProvider: els.optCrossProvider.checked,
+      compact: els.optCompact.checked,
+      balance: els.optBalance.checked,
+      rememberKeys: els.rememberKeys.checked,
+      chunkWords: Number.isFinite(words) ? Math.min(1800, Math.max(200, words)) : 900,
+      concurrency: Number(els.concurrency.value) || 0,
     });
-    refreshSetupState();
+    els.chunkWords.value = state.settings.chunkWords;
+    els.optCrossProvider.disabled = !state.settings.fallback;
+    saveSettings();
+    persistKeys();
   }
 
   function setProvider(provider) {
-    if (!PROVIDER_META[provider] || state.busy) return;
+    if (!state.providers[provider] || state.busy) return;
     state.settings.provider = provider;
     saveSettings();
-    refreshSetupState();
+    renderProviders();
     loadModels();
   }
 
-  const GROUP_NAMES = { recommended: "Recommended", specialized: "Experimental", general: "Other free models" };
+  const GROUP_NAMES = { recommended: "Recommended", specialized: "Experimental", general: "Other models" };
 
   function renderModelOptions(models, selected) {
     const fragment = document.createDocumentFragment();
     const groups = new Map();
     for (const m of models) {
-      const name = GROUP_NAMES[m.group] || "Free models";
+      const name = GROUP_NAMES[m.group] || "Models";
       if (!groups.has(name)) groups.set(name, []);
       groups.get(name).push(m);
     }
@@ -255,17 +426,16 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
 
   async function loadModels({ force = false } = {}) {
     const provider = state.settings.provider;
+    if (keySource(provider) === "missing") return;
     const request = ++state.modelsRequest; // ignore stale responses
     els.refreshModels.disabled = true;
     els.modelHint.textContent = "Loading models…";
-
     try {
-      const res = await fetch("/api/models", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, api_keys: customKeys(), force }),
-      });
-      const data = await res.json().catch(() => null);
+      const { res, data } = await postJson(
+        "/api/models",
+        { provider, api_keys: customKeys(), force },
+        { timeout: 30000 }
+      );
       if (!res.ok || !data || !data.ok) throw new Error(res.status === 401 ? "key" : "load");
       if (request !== state.modelsRequest) return;
 
@@ -277,7 +447,7 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
         saveSettings();
       }
       renderModelOptions(models, selected);
-      els.modelHint.textContent = "All models listed here are free to use. The first one is our recommendation.";
+      els.modelHint.textContent = `${BILLING_NOTE[data.billing] || ""} The first model is our recommendation.`;
     } catch (err) {
       if (request !== state.modelsRequest) return;
       els.modelHint.textContent =
@@ -289,21 +459,19 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     }
   }
 
-  function readOptions() {
-    const words = Number(els.chunkWords.value);
-    Object.assign(state.settings, {
-      fallback: els.optFallback.checked,
-      crossProvider: els.optCrossProvider.checked,
-      rememberKeys: els.rememberKeys.checked,
-      compact: els.optCompact.checked,
-      balance: els.optBalance.checked,
-      chunkWords: Number.isFinite(words) ? Math.min(1800, Math.max(200, words)) : 900,
-      concurrency: Number(els.concurrency.value) || 0,
+  /* ─────────────────────────── navigation ─────────────────────────── */
+  function showView(name) {
+    const view = VIEWS.includes(name) ? name : "check";
+    els.views.forEach((v) => (v.hidden = v.dataset.view !== view));
+    els.navLinks.forEach((link) => {
+      const active = link.dataset.view === view;
+      link.classList.toggle("active", active);
+      if (active) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
     });
-    els.chunkWords.value = state.settings.chunkWords;
-    els.optCrossProvider.disabled = !state.settings.fallback;
-    saveSettings();
-    persistKeys();
+    if (view === "account") renderProfile();
+    if (view === "humanize") els.useLastCheck.hidden = !state.lastCheck;
+    window.scrollTo(0, 0);
   }
 
   /* ─────────────────────────── account view ─────────────────────────── */
@@ -318,66 +486,93 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
   }
 
   /* ─────────────────────────── alerts ─────────────────────────── */
-  function showAlert(title, message, { detail = "", action = false, tone = "error" } = {}) {
-    els.alert.dataset.tone = tone;
-    els.alertTitle.textContent = title;
-    els.alertMessage.textContent = message;
-    els.alertAction.hidden = !action;
-    els.alertDetail.textContent = detail;
-    els.alertDetailWrap.hidden = !detail;
-    els.alert.hidden = false;
+  function showAlert(box, title, message, { detail = "", action = false, tone = "error" } = {}) {
+    box.dataset.tone = tone;
+    box.querySelector(".alert-title").textContent = title;
+    box.querySelector(".alert-message").textContent = message;
+    box.querySelector(".alert-action").hidden = !action;
+    box.querySelector(".alert-detail").textContent = detail;
+    box.querySelector(".alert-detail-wrap").hidden = !detail;
+    box.hidden = false;
   }
-  const hideAlert = () => (els.alert.hidden = true);
+  const hideAlert = (box) => (box.hidden = true);
 
-  /** Plain-language explanation for a failed check. */
-  function explainError(status, error) {
+  /** Plain-language explanation for a failed request. */
+  function explainError(status, error, verb = "check") {
     const detail = [error.message, error.detail].filter(Boolean).join("\n");
     const friendly = {
       401: ["That API key didn't work", "Check the key in Settings, or remove it to use the built-in one.", true],
       402: ["The AI service declined the request", "The account behind this key may be out of credits.", true],
       404: ["That model isn't available anymore", "Pick a different model in Settings.", true],
       429: ["The service is busy right now", "Free AI services limit how often they can be used. Wait a minute and try again.", false],
-      504: ["This is taking too long", "Try again, or check a shorter piece of text.", false],
+      504: ["This is taking too long", `Try again, or ${verb} a shorter piece of text.`, false],
     };
     if (friendly[status]) {
       const [title, message, action] = friendly[status];
       return { title, message, action, detail };
     }
     if (status === 400 && /key/i.test(error.message || "")) {
-      return { title: "One quick setup step", message: "Add an API key in Settings to start checking.", action: true, detail };
+      return { title: "One quick setup step", message: "Add an API key in Settings to get started.", action: true, detail };
     }
     if (status === 400 || status === 413) {
-      return { title: "We couldn't check this text", message: error.message || "Please try again.", action: false, detail: "" };
+      return { title: `We couldn't ${verb} this text`, message: error.message || "Please try again.", action: false, detail: "" };
     }
     return { title: "Something went wrong", message: "The AI service had a problem. Please try again in a moment.", action: false, detail };
   }
 
-  /* ─────────────────────────── loading ─────────────────────────── */
-  function startLoading() {
+  function needsSetup(box) {
+    if (availableProviders().length) return false;
+    showAlert(box, "One quick setup step", "Add an API key in Settings to get started.", { action: true, tone: "info" });
+    return true;
+  }
+
+  /* ─────────────────────────── word limits ─────────────────────────── */
+  function showWordCount(words, stats, note) {
+    stats.textContent = `${words.toLocaleString()} / ${MAX_WORDS.toLocaleString()} words`;
+    stats.dataset.state = words > MAX_WORDS ? "over" : words > MAX_WORDS * 0.9 ? "near" : "ok";
+    const over = words - MAX_WORDS;
+    note.hidden = over <= 0;
+    if (over > 0) {
+      note.textContent =
+        `That's ${words.toLocaleString()} words, which is over the ${MAX_WORDS.toLocaleString()}-word limit. ` +
+        `Please remove about ${plural(over, "word")}, or work on it in parts.`;
+    }
+  }
+
+  function overLimit(text, box) {
+    const words = countWords(text);
+    if (words <= MAX_WORDS) return false;
+    showAlert(
+      box,
+      "This text is too long",
+      `The limit is ${MAX_WORDS.toLocaleString()} words for now. This one has ${words.toLocaleString()}. Please shorten it or work on it in parts.`,
+      { tone: "info" }
+    );
+    return true;
+  }
+
+  /* ─────────────────────────── busy state ─────────────────────────── */
+  function startBusy(button, panel) {
     state.busy = true;
-    els.analyzeBtn.disabled = true;
-    els.analyzeBtn.classList.add("loading");
-    els.editorPanel.classList.add("scanning");
-    hideAlert();
+    button.disabled = true;
+    button.classList.add("loading");
+    panel.classList.add("scanning");
     let n = 0;
-    state.dotTimer = setInterval(() => {
+    const dots = button.querySelector(".dots");
+    const timer = setInterval(() => {
       n = (n + 1) % 4;
-      els.dots.textContent = ".".repeat(n);
+      dots.textContent = ".".repeat(n);
     }, 420);
-    state.noteTimer = setTimeout(() => (els.progressNote.hidden = false), 4000);
+    return () => {
+      state.busy = false;
+      button.disabled = false;
+      button.classList.remove("loading");
+      panel.classList.remove("scanning");
+      clearInterval(timer);
+    };
   }
 
-  function stopLoading() {
-    state.busy = false;
-    els.analyzeBtn.disabled = false;
-    els.analyzeBtn.classList.remove("loading");
-    els.editorPanel.classList.remove("scanning");
-    els.progressNote.hidden = true;
-    clearInterval(state.dotTimer);
-    clearTimeout(state.noteTimer);
-  }
-
-  /* ─────────────────────────── results ─────────────────────────── */
+  /* ─────────────────────────── check results ─────────────────────────── */
   const levelFor = (score) => (score >= 67 ? "high" : score >= 34 ? "mid" : "low");
 
   function verdictFor(score) {
@@ -407,8 +602,9 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     requestAnimationFrame(step);
   }
 
-  function render(result) {
+  function render(result, text) {
     state.analysis = result;
+    state.lastCheck = { text, sentences: result.sentences };
     const score = Number(result.score) || 0;
     const { AI, REFINED, HUMAN } = result.counts;
 
@@ -421,7 +617,8 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     els.verdictNote.textContent =
       flagged === 0
         ? `None of the ${result.total} sentences look AI-written.`
-        : `${flagged} of ${result.total} sentence${result.total === 1 ? "" : "s"} look AI-written or AI-polished.`;
+        : `${flagged} of ${plural(result.total, "sentence")} look AI-written or AI-polished.`;
+    els.humanizeFlagged.hidden = flagged === 0;
 
     els.countAI.textContent = AI;
     els.countRefined.textContent = REFINED;
@@ -431,8 +628,13 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     if (result.fallbacks && result.fallbacks.length) {
       notes.push("The AI service was busy, so a backup model finished your check.");
     }
-    if (result.cached_chunks && result.cached_chunks === result.chunks) {
-      notes.push("You'd already checked this text, so the earlier result was re-used instantly.");
+    const reused = result.reused_sentences || 0;
+    const alreadyChecked = reused ? result.chunks === 0 : result.cached_chunks && result.cached_chunks === result.chunks;
+    if (alreadyChecked) {
+      notes.push("You'd already checked this text, so the result was instant.");
+    } else if (reused) {
+      const fresh = result.total - reused;
+      notes.push(`Only the ${fresh} new or edited sentence${fresh === 1 ? " was" : "s were"} checked. The other ${reused} came from your earlier check.`);
     } else if (result.cached_chunks) {
       notes.push("Unchanged parts were re-used from your last check.");
     }
@@ -455,63 +657,34 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     saveProfile();
   }
 
-  /* ─────────────────────────── check ─────────────────────────── */
   async function analyze() {
     if (state.busy) return;
     const text = els.text.value.trim();
-    const provider = state.settings.provider;
-    hideAlert();
-
-    if (keySource(provider) === "missing") {
-      showAlert("One quick setup step", "Add an API key in Settings to start checking.", { action: true, tone: "info" });
-      return;
-    }
+    hideAlert(els.alert);
+    if (needsSetup(els.alert) || overLimit(text, els.alert)) return;
     if (text.length < MIN_CHARS) {
-      showAlert("A little more text, please", "Paste at least a couple of full sentences so there's enough to go on.", { tone: "info" });
+      showAlert(els.alert, "A little more text, please", "Paste at least a couple of full sentences so there's enough to go on.", { tone: "info" });
       els.text.focus();
       return;
     }
 
-    startLoading();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), UI_TIMEOUT_MS);
-    const s = state.settings;
-
+    const stop = startBusy(els.analyzeBtn, els.editorPanel);
+    const note = setTimeout(() => (els.progressNote.hidden = false), 4000);
     try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          provider,
-          model: currentModel(),
-          api_keys: customKeys(),
-          chunk_words: s.chunkWords,
-          concurrency: s.concurrency,
-          fallback: s.fallback,
-          cross_provider: s.crossProvider,
-          compact: s.compact,
-          balance: s.balance,
-        }),
-        signal: controller.signal,
-      });
-      const data = await res.json().catch(() => null);
-
+      const { res, data } = await postJson("/api/analyze", { text, ...routingOptions() });
       if (!res.ok || !data || !data.ok) {
-        const { title, message, action, detail } = explainError(res.status, (data && data.error) || {});
-        showAlert(title, message, { action, detail });
+        const e = explainError(res.status, (data && data.error) || {});
+        showAlert(els.alert, e.title, e.message, { action: e.action, detail: e.detail });
         return;
       }
-      render(data.result);
+      render(data.result, text);
     } catch (err) {
-      if (err.name === "AbortError") {
-        showAlert("This is taking too long", "Try again, or check a shorter piece of text.");
-      } else {
-        showAlert("Can't reach the app", "Glitch//Detect seems to have stopped running on this computer. Restart it and try again.");
-      }
+      if (err.name === "AbortError") showAlert(els.alert, "This is taking too long", "Try again, or check a shorter piece of text.");
+      else showAlert(els.alert, "Can't reach the app", "Glitch//Detect seems to have stopped running on this computer. Restart it and try again.");
     } finally {
-      clearTimeout(timeout);
-      stopLoading();
+      clearTimeout(note);
+      els.progressNote.hidden = true;
+      stop();
     }
   }
 
@@ -540,17 +713,102 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     setTimeout(() => URL.revokeObjectURL(url), 2000);
   }
 
+  /* ─────────────────────────── humanize ─────────────────────────── */
+  function updateHumanizeStats() {
+    showWordCount(countWords(els.humanizeInput.value), els.humanizeStats, els.humanizeLimitNote);
+  }
+
+  function useLastCheck() {
+    if (!state.lastCheck) return;
+    els.humanizeInput.value = state.lastCheck.text;
+    updateHumanizeStats();
+  }
+
+  function renderRewrite(result) {
+    state.rewrite = result;
+    els.humanizeOutput.innerHTML = result.html; // escaped by the server
+
+    const hasScores = result.score_before !== null && result.score_after !== null;
+    els.scoreShift.hidden = !hasScores || result.rewritten === 0;
+    if (hasScores) {
+      els.shiftFrom.textContent = `${result.score_before}%`;
+      els.shiftTo.textContent = `${result.score_after}%`;
+    }
+
+    let note;
+    if (result.targets === 0) {
+      note = "Nothing needed rewriting: none of the sentences look AI-written.";
+    } else {
+      note = `Rewrote ${result.rewritten} of ${plural(result.targets, "flagged sentence")}.`;
+      if (result.reused) note += ` ${result.reused} came from an earlier rewrite, so they were instant.`;
+      if (result.rewritten < result.targets) note += " The rest were left as they were.";
+    }
+    if (result.fallbacks && result.fallbacks.length) note += " The AI service was busy, so a backup model helped.";
+    els.rewriteNote.textContent = note;
+
+    els.humanizeResult.hidden = false;
+    els.humanizeResult.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function runHumanize() {
+    if (state.busy) return;
+    const text = els.humanizeInput.value.trim();
+    hideAlert(els.hAlert);
+    if (needsSetup(els.hAlert) || overLimit(text, els.hAlert)) return;
+    if (text.length < MIN_CHARS) {
+      showAlert(els.hAlert, "A little more text, please", "Paste at least a couple of full sentences to rewrite.", { tone: "info" });
+      els.humanizeInput.focus();
+      return;
+    }
+
+    // Labels from the last check save the detector call when the text matches.
+    const labels = state.lastCheck && state.lastCheck.text === text ? state.lastCheck.sentences : undefined;
+    const stop = startBusy(els.humanizeBtn, els.humanizePanel);
+    try {
+      const { res, data } = await postJson("/api/humanize", {
+        text,
+        tone: els.humanizeTone.value,
+        only_flagged: els.onlyFlagged.checked,
+        second_pass: els.secondPass.checked,
+        labels,
+        ...routingOptions(),
+      });
+      if (!res.ok || !data || !data.ok) {
+        const e = explainError(res.status, (data && data.error) || {}, "rewrite");
+        showAlert(els.hAlert, e.title, e.message, { action: e.action, detail: e.detail });
+        return;
+      }
+      renderRewrite(data.result);
+    } catch (err) {
+      if (err.name === "AbortError") showAlert(els.hAlert, "This is taking too long", "Try again, or rewrite a shorter piece of text.");
+      else showAlert(els.hAlert, "Can't reach the app", "Glitch//Detect seems to have stopped running on this computer. Restart it and try again.");
+    } finally {
+      stop();
+    }
+  }
+
+  async function copyRewrite() {
+    if (!state.rewrite) return;
+    try {
+      await navigator.clipboard.writeText(state.rewrite.text);
+      els.copyRewrite.textContent = "Copied ✓";
+      setTimeout(() => (els.copyRewrite.textContent = "Copy"), 1500);
+    } catch {
+      showAlert(els.hAlert, "Couldn't copy", "Your browser blocked the clipboard. Select the text and copy it manually.", { tone: "info" });
+    }
+  }
+
   /* ─────────────────────────── wire up ─────────────────────────── */
   let statsFrame = 0;
   function updateStats() {
     cancelAnimationFrame(statsFrame);
-    statsFrame = requestAnimationFrame(() => {
-      const words = els.text.value.trim() ? els.text.value.trim().split(/\s+/).length : 0;
-      els.textStats.textContent = `${words.toLocaleString()} word${words === 1 ? "" : "s"}`;
-    });
+    statsFrame = requestAnimationFrame(() => showWordCount(countWords(els.text.value), els.textStats, els.limitNote));
   }
 
   window.addEventListener("hashchange", () => showView(location.hash.slice(1)));
+  document.querySelectorAll(".alert-close").forEach((btn) =>
+    btn.addEventListener("click", () => hideAlert(btn.closest(".alert")))
+  );
 
   els.text.addEventListener("input", updateStats);
   els.text.addEventListener("keydown", (event) => {
@@ -572,50 +830,54 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     updateStats();
     els.results.hidden = true;
     els.emptyState.hidden = false;
-    hideAlert();
+    hideAlert(els.alert);
     state.analysis = null;
     els.text.focus();
   });
-  els.alertClose.addEventListener("click", hideAlert);
   els.showTags.addEventListener("change", () => els.doc.classList.toggle("show-tags", els.showTags.checked));
   els.downloadBtn.addEventListener("click", downloadReport);
+  els.humanizeFlagged.addEventListener("click", () => {
+    useLastCheck();
+    els.onlyFlagged.checked = true;
+    location.hash = "#humanize";
+    runHumanize();
+  });
 
-  els.providerChoices.forEach((btn) => btn.addEventListener("click", () => setProvider(btn.dataset.providerChoice)));
+  els.humanizeInput.addEventListener("input", updateHumanizeStats);
+  els.useLastCheck.addEventListener("click", useLastCheck);
+  els.humanizeBtn.addEventListener("click", runHumanize);
+  els.humanizeTone.addEventListener("change", () => {
+    state.settings.tone = els.humanizeTone.value;
+    saveSettings();
+  });
+  els.copyRewrite.addEventListener("click", copyRewrite);
+  els.checkRewrite.addEventListener("click", () => {
+    if (!state.rewrite) return;
+    els.text.value = state.rewrite.text;
+    updateStats();
+    location.hash = "#check";
+    analyze();
+  });
+
   els.model.addEventListener("change", () => {
     state.settings.models[state.settings.provider] = els.model.value;
     saveSettings();
   });
   els.refreshModels.addEventListener("click", () => loadModels({ force: true }));
-  [els.optFallback, els.optCrossProvider, els.optCompact, els.optBalance, els.rememberKeys, els.concurrency, els.chunkWords].forEach((el) =>
-    el.addEventListener("change", readOptions)
+  [els.optFallback, els.optCrossProvider, els.optCompact, els.optBalance, els.rememberKeys, els.concurrency, els.chunkWords].forEach(
+    (el) => el.addEventListener("change", readOptions)
   );
-
-  document.querySelectorAll("[data-key-input]").forEach((input) => {
-    input.addEventListener("input", () => {
-      const p = input.dataset.keyInput;
-      state.keys[p] = input.value.trim();
-      persistKeys();
-      refreshSetupState();
-      if (p === state.settings.provider) {
-        clearTimeout(state.keyTimer);
-        state.keyTimer = setTimeout(loadModels, 800);
-      }
-    });
+  els.addKey.addEventListener("click", addKey);
+  els.newKey.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addKey();
+    }
   });
-  document.querySelectorAll("[data-key-toggle]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const input = document.querySelector(`[data-key-input="${btn.dataset.keyToggle}"]`);
-      const showing = input.type === "text";
-      input.type = showing ? "password" : "text";
-      btn.textContent = showing ? "Show" : "Hide";
-    });
-  });
-  document.querySelectorAll("[data-key-clear]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const input = document.querySelector(`[data-key-input="${btn.dataset.keyClear}"]`);
-      input.value = "";
-      input.dispatchEvent(new Event("input"));
-    });
+  els.toggleNewKey.addEventListener("click", () => {
+    const showing = els.newKey.type === "text";
+    els.newKey.type = showing ? "password" : "text";
+    els.toggleNewKey.textContent = showing ? "Show" : "Hide";
   });
 
   els.displayName.addEventListener("input", () => {
@@ -638,22 +900,11 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
   });
 
   /* ─────────────────────────── init ─────────────────────────── */
-  async function checkHealth() {
-    try {
-      const res = await fetch("/api/health", { cache: "no-store" });
-      els.nodeStatus.dataset.state = res.ok ? "online" : "offline";
-      els.nodeLabel.textContent = res.ok ? "Ready" : "Offline";
-    } catch {
-      els.nodeStatus.dataset.state = "offline";
-      els.nodeLabel.textContent = "Offline";
-    }
-  }
-
   load();
   fillSettings();
   renderProfile();
   updateStats();
+  updateHumanizeStats();
   showView(location.hash.slice(1));
-  checkHealth();
-  loadModels();
+  loadProviders();
 })();

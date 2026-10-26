@@ -12,17 +12,9 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
-<body>
+<body data-default-provider="{{ default_provider }}" data-default-model="{{ default_model }}"
+      data-min-chars="{{ min_chars }}" data-max-words="{{ max_words }}">
 <div class="bg-grid" aria-hidden="true"></div>
-
-<!-- Provider metadata for the script; nothing here is displayed. -->
-<div id="providerData" hidden>
-  {% for key, p in providers.items() %}
-  <span data-provider="{{ key }}" data-label="{{ p.label }}"
-        data-default-model="{{ p.default_model }}" data-keys-url="{{ p.keys_url }}"
-        data-placeholder="{{ p.key_placeholder }}" data-ready="{{ '1' if p.env_key else '' }}"></span>
-  {% endfor %}
-</div>
 
 <div class="shell">
   <!-- ───────────────────────── sidebar ───────────────────────── -->
@@ -40,7 +32,6 @@
       <a class="sb-link" href="#humanize" data-view="humanize">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></svg>
         <span>Humanize</span>
-        <span class="soon-tag">SOON</span>
       </a>
       <a class="sb-link" href="#settings" data-view="settings">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
@@ -71,20 +62,20 @@
       <section class="panel editor-panel" id="editorPanel">
         <div class="textarea-shell">
           <textarea id="text" spellcheck="false" maxlength="{{ max_chars }}" aria-label="Text to check"
-            data-min-chars="{{ min_chars }}"
-            placeholder="Paste an essay, article, email… anything with at least a few sentences."></textarea>
+            placeholder="Paste an essay, article, email… anything with at least a few sentences (up to {{ '{:,}'.format(max_words) }} words)."></textarea>
           <div class="scan-sweep" aria-hidden="true"></div>
         </div>
 
         <div class="editor-actions">
           <button id="analyzeBtn" class="btn-primary" type="button">
             <span class="btn-label">CHECK TEXT</span>
-            <span class="btn-loading"><i></i> CHECKING<span id="dots"></span></span>
+            <span class="btn-loading"><i></i> CHECKING<span class="dots"></span></span>
           </button>
           <button id="sampleBtn" class="btn-ghost" type="button">Try an example</button>
           <button id="clearBtn" class="btn-ghost" type="button">Clear</button>
-          <span class="text-stats" id="textStats">0 words</span>
+          <span class="text-stats" id="textStats" data-state="ok">0 / {{ '{:,}'.format(max_words) }} words</span>
         </div>
+        <p class="limit-note" id="limitNote" role="status" hidden></p>
         <p class="progress-note" id="progressNote" hidden>Reading your text… longer pieces can take up to a minute.</p>
       </section>
 
@@ -92,15 +83,15 @@
         <div class="alert-head">
           <span class="alert-icon" aria-hidden="true">!</span>
           <div class="alert-body">
-            <strong id="alertTitle">Something went wrong</strong>
-            <p id="alertMessage"></p>
-            <a class="alert-action" id="alertAction" href="#settings" hidden>Open settings →</a>
+            <strong class="alert-title">Something went wrong</strong>
+            <p class="alert-message"></p>
+            <a class="alert-action" href="#settings" hidden>Open settings →</a>
           </div>
-          <button class="mini-btn" id="alertClose" type="button" aria-label="Dismiss">✕</button>
+          <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
         </div>
-        <details id="alertDetailWrap" hidden>
+        <details class="alert-detail-wrap" hidden>
           <summary>Technical details</summary>
-          <pre id="alertDetail"></pre>
+          <pre class="alert-detail"></pre>
         </details>
       </div>
 
@@ -152,8 +143,7 @@
                 <span class="switch-track"><span class="switch-thumb"></span></span>
                 <span class="switch-label">Show labels</span>
               </label>
-              <button class="mini-btn" id="humanizeFlagged" type="button" disabled
-                      title="Coming soon">Humanize flagged <span class="soon-tag">SOON</span></button>
+              <button class="mini-btn accent" id="humanizeFlagged" type="button">Humanize flagged →</button>
               <button class="mini-btn" id="downloadBtn" type="button">Download</button>
             </div>
           </div>
@@ -183,39 +173,96 @@
     <!-- ───────────────────────── humanize ───────────────────────── -->
     <section class="view" id="view-humanize" data-view="humanize" hidden>
       <header class="page-head">
-        <p class="eyebrow">Coming soon</p>
-        <h1>Humanize</h1>
-        <p class="page-sub">Rewrite AI-sounding sentences so they read naturally, in your own voice.</p>
+        <p class="eyebrow">Rewrite</p>
+        <h1>Make it sound like you</h1>
+        <p class="page-sub">We rewrite only the sentences that read as AI-written, and leave the rest of your words alone.</p>
       </header>
 
-      <section class="panel humanize-panel">
-        <div class="humanize-grid">
-          <div>
-            <label class="field-label" for="humanizeInput">Original</label>
-            <textarea id="humanizeInput" class="humanize-box" spellcheck="false"
-              placeholder="Text to rewrite. You'll be able to send flagged sentences here straight from a check."></textarea>
-          </div>
-          <div>
-            <span class="field-label">Rewritten</span>
-            <div class="humanize-box humanize-output" aria-live="polite">
-              <span>Your rewritten text will appear here.</span>
-            </div>
-          </div>
+      <section class="panel editor-panel" id="humanizePanel">
+        <div class="panel-head">
+          <h2>Your draft</h2>
+          <button class="mini-btn" id="useLastCheck" type="button" hidden>Use my last check</button>
         </div>
+        <div class="textarea-shell">
+          <textarea id="humanizeInput" class="humanize-box" spellcheck="false" aria-label="Text to rewrite"
+            placeholder="Paste the text you want to rewrite, or press “Humanize flagged” after a check."></textarea>
+          <div class="scan-sweep" aria-hidden="true"></div>
+        </div>
+        <p class="text-stats humanize-stats" id="humanizeStats" data-state="ok">0 / {{ '{:,}'.format(max_words) }} words</p>
+        <p class="limit-note" id="humanizeLimitNote" role="status" hidden></p>
+
         <div class="humanize-options">
-          <label class="field-label" for="humanizeTone">Tone</label>
-          <select id="humanizeTone" disabled>
-            <option>Natural</option>
-            <option>Casual</option>
-            <option>Academic</option>
-            <option>Professional</option>
-          </select>
+          <div>
+            <label class="field-label" for="humanizeTone">Tone</label>
+            <select id="humanizeTone">
+              {% for key in tones %}<option value="{{ key }}">{{ key|capitalize }}</option>{% endfor %}
+            </select>
+          </div>
+          <label class="toggle-row" for="onlyFlagged">
+            <span>
+              <strong>Only rewrite sentences that look AI-written</strong>
+              <small>Keeps your own sentences untouched and uses far less of your allowance.</small>
+            </span>
+            <span class="switch"><input type="checkbox" id="onlyFlagged" checked><span class="switch-track"><span class="switch-thumb"></span></span></span>
+          </label>
+          <label class="toggle-row" for="secondPass">
+            <span>
+              <strong>Extra polish</strong>
+              <small>Rewrites anything that still looks AI-written once more. Takes longer.</small>
+            </span>
+            <span class="switch"><input type="checkbox" id="secondPass"><span class="switch-track"><span class="switch-thumb"></span></span></span>
+          </label>
         </div>
+
         <div class="editor-actions">
-          <button class="btn-primary" type="button" disabled>REWRITE</button>
-          <span class="soon-note">We're still building this. Stay tuned!</span>
+          <button class="btn-primary" id="humanizeBtn" type="button">
+            <span class="btn-label">REWRITE</span>
+            <span class="btn-loading"><i></i> REWRITING<span class="dots"></span></span>
+          </button>
         </div>
       </section>
+
+      <div class="alert" id="hAlert" role="alert" hidden>
+        <div class="alert-head">
+          <span class="alert-icon" aria-hidden="true">!</span>
+          <div class="alert-body">
+            <strong class="alert-title">Something went wrong</strong>
+            <p class="alert-message"></p>
+            <a class="alert-action" href="#settings" hidden>Open settings →</a>
+          </div>
+          <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+        </div>
+        <details class="alert-detail-wrap" hidden>
+          <summary>Technical details</summary>
+          <pre class="alert-detail"></pre>
+        </details>
+      </div>
+
+      <section class="panel doc-panel" id="humanizeResult" hidden aria-live="polite">
+        <div class="panel-head">
+          <h2>Rewritten</h2>
+          <div class="doc-tools">
+            <button class="mini-btn" id="copyRewrite" type="button">Copy</button>
+            <button class="mini-btn accent" id="checkRewrite" type="button">Check this text →</button>
+          </div>
+        </div>
+        <div class="rewrite-summary">
+          <div class="score-shift" id="scoreShift" hidden>
+            <span class="shift-from" id="shiftFrom">—</span>
+            <span class="shift-arrow" aria-hidden="true">→</span>
+            <span class="shift-to" id="shiftTo">—</span>
+            <span class="shift-label">likely AI</span>
+          </div>
+          <p class="rewrite-note" id="rewriteNote"></p>
+        </div>
+        <div class="doc-legend"><span><i class="dot changed"></i>Rewritten sentences</span></div>
+        <div class="doc" id="humanizeOutput"></div>
+      </section>
+
+      <p class="disclaimer">
+        Rewrites can change nuance. Read the result before using it, and be honest about how
+        your writing was produced where that matters, such as school or work.
+      </p>
     </section>
 
     <!-- ───────────────────────── settings ───────────────────────── -->
@@ -228,16 +275,9 @@
 
       <section class="panel settings-card">
         <h2>AI service</h2>
-        <p class="card-sub">The free service that reads your text. Both work well.</p>
-        <div class="choice-grid" role="radiogroup" aria-label="AI service">
-          {% for key, p in providers.items() %}
-          <button class="choice" type="button" role="radio" aria-checked="false" data-provider-choice="{{ key }}">
-            <span class="choice-title">{{ p.label }}</span>
-            <span class="choice-desc">{{ 'Wide choice of free models.' if key == 'openrouter' else 'Very fast responses.' }}</span>
-            <span class="choice-status" data-status="{{ key }}"></span>
-          </button>
-          {% endfor %}
-        </div>
+        <p class="card-sub">The service that reads your text.</p>
+        <div class="choice-grid" role="radiogroup" aria-label="AI service" id="providerChoices"></div>
+        <p class="hint" id="noProviders" hidden>No AI service is set up yet. Add an API key below to get started.</p>
 
         <label class="field-label" for="model">Model</label>
         <div class="model-row">
@@ -246,7 +286,7 @@
           </select>
           <button id="refreshModels" class="mini-btn" type="button" aria-label="Refresh model list" title="Refresh list">⟳</button>
         </div>
-        <p class="hint" id="modelHint">All models listed here are free to use. The first one is our recommendation.</p>
+        <p class="hint" id="modelHint">The first model is our recommendation.</p>
       </section>
 
       <section class="panel settings-card">
@@ -261,8 +301,8 @@
         </label>
         <label class="toggle-row" for="optCrossProvider">
           <span>
-            <strong>Allow switching to the other service</strong>
-            <small>Only used when both services are set up.</small>
+            <strong>Allow switching to another free service</strong>
+            <small>Only used when more than one service is set up. Paid services are never used as a backup.</small>
           </span>
           <span class="switch"><input type="checkbox" id="optCrossProvider" checked><span class="switch-track"><span class="switch-thumb"></span></span></span>
         </label>
@@ -271,24 +311,17 @@
       <section class="panel settings-card">
         <h2>Your own API keys <span class="optional">optional</span></h2>
         <p class="card-sub">
-          Glitch//Detect works out of the box when a key is already set up. Add your own key
-          if you'd rather use your personal account.
+          Paste a key from any supported service and we'll recognise which one it's for.
+          Your keys stay in this browser tab.
         </p>
-
-        {% for key, p in providers.items() %}
-        <div class="key-card" data-provider="{{ key }}">
-          <div class="key-card-head">
-            <label class="key-card-title" for="key-{{ key }}">{{ p.label }}</label>
-            <a href="{{ p.keys_url }}" target="_blank" rel="noopener noreferrer">Get a free key ↗</a>
-          </div>
-          <div class="key-row">
-            <input id="key-{{ key }}" type="password" spellcheck="false" autocomplete="off"
-                   data-key-input="{{ key }}" placeholder="Paste your {{ p.label }} key">
-            <button class="mini-btn" type="button" data-key-toggle="{{ key }}" aria-label="Show {{ p.label }} key">Show</button>
-            <button class="mini-btn" type="button" data-key-clear="{{ key }}" aria-label="Remove {{ p.label }} key">Remove</button>
-          </div>
+        <div class="key-row add-key-row">
+          <input id="newKey" type="password" spellcheck="false" autocomplete="off" aria-label="API key"
+                 placeholder="Paste an API key (Groq, OpenRouter, Gemini, OpenAI, Mistral…)">
+          <button class="mini-btn" type="button" id="toggleNewKey" aria-label="Show key">Show</button>
+          <button class="btn-ghost compact" type="button" id="addKey">Add key</button>
         </div>
-        {% endfor %}
+        <p class="key-feedback" id="keyFeedback" role="status" hidden></p>
+        <ul class="key-list" id="keyList"></ul>
 
         <label class="toggle-row" for="rememberKeys">
           <span>
@@ -367,7 +400,7 @@
 
       <section class="panel settings-card">
         <h2>Privacy</h2>
-        <p class="card-sub">Your text is only sent to the AI service you chose, and only when you press Check.</p>
+        <p class="card-sub">Your text is only sent to the AI service you chose, and only when you press Check or Rewrite.</p>
         <button class="btn-ghost danger" id="clearData" type="button">Clear my data on this device</button>
       </section>
     </section>

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
+from functools import wraps
 
 from flask import Flask, jsonify, render_template, request
 
-from . import catalogue, config
-from .analyzer import ScanOptions, analyze
+from . import catalogue, config, keys
+from .analyzer import analyze
 from .errors import DetectorError
 from .humanize import humanize
+from .prompt import TONES
 from .providers import DEFAULT_MODEL, DEFAULT_PROVIDER, PROVIDERS, get_provider
+from .routing import ScanOptions
 
 log = logging.getLogger("glitch")
 
-# The server can spend keys from .env, so only same-machine origins may call
+# The server can spend its own keys, so only same-machine origins may call
 # it. Checking Host blocks DNS-rebinding pages from reaching the API.
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 
@@ -38,30 +42,81 @@ def _error(message: str, status: int, detail: str = ""):
     )
 
 
+def _word_limit_error(text: str):
+    words = len(text.split())
+    if words > config.MAX_WORDS:
+        return _error(
+            f"That's {words:,} words. The limit is {config.MAX_WORDS:,} words per check. "
+            "Please shorten it or check it in parts.",
+            413,
+        )
+    return None
+
+
+def _payload() -> dict:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _provider_of(payload: dict) -> str:
+    return get_provider(str(payload.get("provider") or DEFAULT_PROVIDER)).id
+
+
 def _keys_from(payload: dict, provider: str) -> dict:
-    """User-supplied keys (``api_keys`` map or legacy ``api_key``) over .env."""
+    """The user's own keys (``api_keys`` map or legacy ``api_key``) over the server's."""
     supplied = payload.get("api_keys")
-    supplied = supplied if isinstance(supplied, dict) else {}
+    supplied = dict(supplied) if isinstance(supplied, dict) else {}
     if payload.get("api_key") and not supplied.get(provider):
-        supplied = {**supplied, provider: payload["api_key"]}
-    return {
-        p: config.resolve_key(p, str(supplied.get(p) or "")) for p in PROVIDERS
-    }
+        supplied[provider] = payload["api_key"]
+    return keys.resolve_request_keys(supplied)
 
 
-def _provider_status() -> dict:
-    return {
-        key: {
-            "label": cfg["label"],
-            "default_model": cfg["default_model"],
-            "keys_url": cfg["keys_url"],
-            "key_placeholder": cfg["key_placeholder"],
-            "env_key": bool(config.env_key(key)),
-            "env_var": config.ENV_KEY_NAMES[key],
-            "free_only": True,
+def _options(payload: dict) -> ScanOptions:
+    def as_int(name: str, default: int) -> int:
+        try:
+            return int(payload.get(name) or default)
+        except (TypeError, ValueError):
+            return default
+
+    return ScanOptions(
+        chunk_words=as_int("chunk_words", 900),
+        fallback=payload.get("fallback", True) is not False,
+        cross_provider=payload.get("cross_provider", True) is not False,
+        concurrency=as_int("concurrency", 0),
+        compact=payload.get("compact", True) is not False,
+        balance=payload.get("balance", True) is not False,
+    )
+
+
+def _providers_public() -> list[dict]:
+    """Every supported provider and whether the server can use it. No keys."""
+    ready = keys.store.ready_providers()
+    return [
+        {
+            "id": spec.id,
+            "label": spec.label,
+            "billing": spec.billing,
+            "keys_url": spec.keys_url,
+            "default_model": spec.default_model,
+            "ready": spec.id in ready,
         }
-        for key, cfg in PROVIDERS.items()
-    }
+        for spec in PROVIDERS.values()
+    ]
+
+
+def _admin_only(view):
+    """Admin routes exist only when ADMIN_TOKEN is set, and require it."""
+
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not config.ADMIN_TOKEN:
+            return _error("Not found.", 404)
+        supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        if not hmac.compare_digest(supplied.encode(), config.ADMIN_TOKEN.encode()):
+            return _error("Admin token required.", 401)
+        return view(*args, **kwargs)
+
+    return wrapper
 
 
 def create_app() -> Flask:
@@ -91,120 +146,146 @@ def create_app() -> Flask:
         response.headers["Content-Security-Policy"] = _CSP
         return response
 
+    @app.errorhandler(DetectorError)
+    def detector_error(exc: DetectorError):
+        log.warning("%s %s: %s %s", request.method, request.path, exc.status, exc.message)
+        return _error(exc.message, exc.status, exc.detail)
+
     @app.get("/")
     def index():
         return render_template(
             "index.html",
-            providers=_provider_status(),
             default_provider=DEFAULT_PROVIDER,
             default_model=DEFAULT_MODEL,
             max_chars=config.MAX_CHARS,
             min_chars=config.MIN_CHARS,
+            max_words=config.MAX_WORDS,
+            tones=TONES,
         )
 
     @app.get("/api/health")
     def health():
+        return jsonify({"ok": True, "service": "glitch-detect", "providers": _providers_public()})
+
+    @app.get("/api/providers")
+    def providers():
+        return jsonify({"ok": True, "default": DEFAULT_PROVIDER, "providers": _providers_public()})
+
+    @app.post("/api/keys/identify")
+    def identify_key():
+        """Which provider a user's own key belongs to. The key is not stored."""
+        match = keys.resolve(str(_payload().get("key") or ""))
+        spec = PROVIDERS[match.provider]
         return jsonify(
-            {
-                "ok": True,
-                "service": "glitch-detect",
-                "default_provider": DEFAULT_PROVIDER,
-                "providers": _provider_status(),
-            }
+            {"ok": True, "provider": spec.id, "label": spec.label, "verified": match.verified}
         )
 
     @app.post("/api/models")
     def models():
-        """Free models only, ranked for the sentence-classification task."""
-        payload = request.get_json(silent=True) or {}
-        provider = str(payload.get("provider") or DEFAULT_PROVIDER).strip().lower()
-        try:
-            key = _keys_from(payload, get_provider(provider)["key"])[provider]
-            data = catalogue.list_models(provider, key, force=bool(payload.get("force")))
-        except DetectorError as exc:
-            log.warning("model list failed: %s %s", exc.status, exc.message)
-            return _error(exc.message, exc.status, exc.detail)
+        payload = _payload()
+        provider = _provider_of(payload)
+        key = _keys_from(payload, provider)[provider]
+        data = catalogue.list_models(provider, key, force=bool(payload.get("force")))
         return jsonify({"ok": True, **data})
 
     @app.post("/api/analyze")
     def analyze_endpoint():
-        payload = request.get_json(silent=True) or {}
+        payload = _payload()
         text = str(payload.get("text") or "").strip()
-        provider = str(payload.get("provider") or DEFAULT_PROVIDER).strip().lower()
-        model = str(payload.get("model") or "").strip()
-
-        def as_int(name: str, default: int) -> int:
-            try:
-                return int(payload.get(name) or default)
-            except (TypeError, ValueError):
-                return default
-
-        options = ScanOptions(
-            chunk_words=as_int("chunk_words", 900),
-            fallback=payload.get("fallback", True) is not False,
-            cross_provider=payload.get("cross_provider", True) is not False,
-            concurrency=as_int("concurrency", 0),
-            compact=payload.get("compact", True) is not False,
-            balance=payload.get("balance", True) is not False,
-        )
-
         if len(text) < config.MIN_CHARS:
             return _error(
-                f"Paste at least a couple of sentences ({config.MIN_CHARS}+ characters).",
-                400,
+                f"Paste at least a couple of sentences ({config.MIN_CHARS}+ characters).", 400
             )
         if len(text) > config.MAX_CHARS:
             return _error(
                 f"Text is too long ({len(text):,} characters). The limit is {config.MAX_CHARS:,}.",
                 413,
             )
+        if (too_long := _word_limit_error(text)) is not None:
+            return too_long
 
+        provider = _provider_of(payload)
         try:
-            keys = _keys_from(payload, get_provider(provider)["key"])
             result = analyze(
-                text, provider=provider, model=model, keys=keys, options=options
+                text,
+                provider=provider,
+                model=str(payload.get("model") or "").strip(),
+                keys=_keys_from(payload, provider),
+                options=_options(payload),
             )
-        except DetectorError as exc:
-            log.warning("analysis failed: %s %s", exc.status, exc.message)
-            return _error(exc.message, exc.status, exc.detail)
+        except DetectorError:
+            raise
         except Exception:
             log.exception("unexpected analysis failure")
-            return _error(
-                "Unexpected server error while analyzing. Check the server log.", 500
-            )
+            return _error("Unexpected server error while analyzing. Check the server log.", 500)
 
         log.info(
-            "analyzed %s words / %s sentences -> %s%% (%s / %s, %s mode, %s chunks"
-            " [%s cached], %s tokens, %sms%s)",
-            result["words"],
-            result["total"],
-            result["score"],
-            result["provider"],
-            result["model"],
-            result["mode"],
-            result["chunks"],
-            result["cached_chunks"],
-            result["usage"]["total_tokens"],
-            result["elapsed_ms"],
+            "analyzed %s words / %s sentences -> %s%% (%s / %s, %s mode, %s calls,"
+            " %s reused, %s tokens, %sms%s)",
+            result["words"], result["total"], result["score"], result["provider"],
+            result["model"], result["mode"], result["chunks"], result["reused_sentences"],
+            result["usage"]["total_tokens"], result["elapsed_ms"],
             f", {len(result['fallbacks'])} fallback(s)" if result["fallbacks"] else "",
         )
         return jsonify({"ok": True, "result": result})
 
     @app.post("/api/humanize")
     def humanize_endpoint():
-        payload = request.get_json(silent=True) or {}
-        provider = str(payload.get("provider") or DEFAULT_PROVIDER).strip().lower()
+        payload = _payload()
+        text = str(payload.get("text") or "").strip()
+        if (too_long := _word_limit_error(text)) is not None:
+            return too_long
+        if len(text) < config.MIN_CHARS:
+            return _error("Paste at least a couple of full sentences to rewrite.", 400)
+
+        provider = _provider_of(payload)
+        labels = payload.get("labels")
         try:
-            keys = _keys_from(payload, get_provider(provider)["key"])
             result = humanize(
-                str(payload.get("text") or ""),
+                text,
                 provider=provider,
-                model=str(payload.get("model") or ""),
-                api_key=keys[provider],
+                model=str(payload.get("model") or "").strip(),
+                keys=_keys_from(payload, provider),
+                tone=str(payload.get("tone") or "natural"),
+                only_flagged=payload.get("only_flagged", True) is not False,
+                labels=labels if isinstance(labels, list) else None,
+                second_pass=bool(payload.get("second_pass")),
+                options=_options(payload),
             )
-        except DetectorError as exc:
-            return _error(exc.message, exc.status, exc.detail)
+        except DetectorError:
+            raise
+        except Exception:
+            log.exception("unexpected humanize failure")
+            return _error("Unexpected server error while rewriting. Check the server log.", 500)
+
+        log.info(
+            "humanized %s/%s sentences (%s reused, %s tokens, score %s -> %s, %sms)",
+            result["rewritten"], result["targets"], result["reused"],
+            result["usage"]["total_tokens"], result["score_before"], result["score_after"],
+            result["elapsed_ms"],
+        )
         return jsonify({"ok": True, "result": result})
+
+    # -- admin: key management for a future dashboard -------------------------
+    @app.get("/api/admin/keys")
+    @_admin_only
+    def admin_list_keys():
+        return jsonify({"ok": True, "keys": keys.store.list(), "providers": _providers_public()})
+
+    @app.post("/api/admin/keys")
+    @_admin_only
+    def admin_add_key():
+        payload = _payload()
+        entry = keys.store.add(str(payload.get("key") or ""), str(payload.get("label") or ""))
+        log.info("admin added a %s key (%s)", entry["provider"], entry["key"])
+        return jsonify({"ok": True, "key": entry}), 201
+
+    @app.delete("/api/admin/keys/<entry_id>")
+    @_admin_only
+    def admin_remove_key(entry_id: str):
+        if not keys.store.remove(entry_id):
+            return _error("No such key (keys from the environment can't be removed here).", 404)
+        return jsonify({"ok": True})
 
     @app.errorhandler(413)
     def too_large(_):
