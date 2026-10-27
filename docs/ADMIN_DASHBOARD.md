@@ -1,5 +1,29 @@
 # Admin dashboard — brief for the implementing agent
 
+## Status (26 Oct 2026)
+
+**Built:** `/admin` (`frontend/admin.html`, `static/admin.js`, `static/admin.css`)
+with a token gate and four views:
+
+- **API keys**: add (provider recognised automatically), list masked, remove.
+- **Users**: search and filter, plan/status badges, today's usage, manage
+  panel (grant Premium/Family for N days, change plan/status/notes, reset
+  today's usage, sign out everywhere, suspend, delete), add an account.
+- **Analytics**: anonymous usage (`backend/glitch/analytics.py`) plus account
+  counts by plan and status (`users.store.summary()`).
+- **Providers**: readiness and billing.
+
+Accounts, sessions, plans and quotas live in `backend/glitch/users.py`; the
+admin routes are listed in the README's *Admin dashboard* section.
+
+**Still to build** (each needs an external service or a product decision):
+PayChangu checkout and payment webhooks (moving `pending_payment` → `active`
+automatically), renewal reminders, ads on the free tier, Family seat
+invitations, and the optional key extensions in §6.
+
+The rest of this brief is the original specification; keep following its
+constraints (§3) and look-and-feel rules (§4) for further admin work.
+
 You are building the admin dashboard for **Glitch//Detect**, a local-first
 AI-writing detector and humanizer (FastAPI backend + static vanilla-JS
 frontend, no build step). The
@@ -228,7 +252,7 @@ kept, and add tests.
 |---|---|
 | Edit label | `PATCH /api/admin/keys/<id> {label}` → add `KeyStore.relabel()`. |
 | Re-verify a key | `POST /api/admin/keys/<id>/verify` → `keys.probe(key, provider)`; update `verified`. |
-| Usage stats | No counters exist. `analyze`/`humanize` results carry `usage.total_tokens`, `models_used`, `fallbacks`; aggregate them in memory in `api.py` (per provider, per day) and expose `GET /api/admin/stats`. Do not persist user text. |
+| Usage stats | **Done** — `GET /api/admin/analytics` (anonymous counters) and per-account usage in `GET /api/admin/users/<id>`. |
 | Key priority | Let the admin choose which key is active per provider (store an `order` field). |
 | Multiple keys per provider rotation | Would need routing changes (`keys.resolve_request_keys`, `routing.run_job`); discuss before building. |
 

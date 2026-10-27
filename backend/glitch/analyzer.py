@@ -31,6 +31,7 @@ from .text import (
     chunk_text,
     document_sentences,
     group_sentences,
+    normalize_text,
     split_sentences,
 )
 
@@ -172,7 +173,8 @@ def analyze(
     spec = get_provider(provider)
     keys = {p: (keys or {}).get(p, "").strip() for p in PROVIDERS}
 
-    text = (text or "").strip()
+    # Detectors see through invisible characters and lookalike letters; so do we.
+    text = normalize_text(text).strip()
     if not text:
         raise DetectorError("Paste some text to analyze.", status=400)
     validate_key(spec.id, keys[spec.id])

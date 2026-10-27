@@ -47,6 +47,12 @@ class ProviderSpec:
     reasoning_models: str = ""   # regex: models that spend hidden thinking tokens
     low_effort_models: str = ""  # regex: models that accept reasoning_effort="low"
     extra_headers: dict = field(default_factory=dict)
+    # How the key is sent, in order of preference: "bearer" (Authorization:
+    # Bearer) or "google" (x-goog-api-key). The client remembers which works.
+    auth_styles: tuple[str, ...] = ("bearer",)
+    # Output may carry an invisible statistical watermark (Gemini: SynthID).
+    # Disclosed in results; never "stripped" by another model.
+    watermarks_output: bool = False
     concurrency: int = 2         # parallel requests for one scan
     balance_width: int = 2       # models to spread one scan over
 
@@ -135,7 +141,12 @@ _SPECS = [
         id="gemini",
         label="Google Gemini",
         default_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        key_patterns=(r"^AIza[0-9A-Za-z_\-]{30,}$",),
+        # AI Studio issued "AIza…" keys until 2026, and now issues "AQ." keys.
+        key_patterns=(r"^AIza[0-9A-Za-z_\-]{30,}$", r"^AQ\.[0-9A-Za-z_\-]{20,}$"),
+        # "AQ." keys sent as a Bearer token are read as OAuth tokens and fail
+        # (ACCESS_TOKEN_TYPE_UNSUPPORTED); Google's docs use x-goog-api-key.
+        auth_styles=("google", "bearer"),
+        watermarks_output=True,
         env_vars=("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_KEY"),
         keys_url="https://aistudio.google.com/apikey",
         billing=FREE_TIER,

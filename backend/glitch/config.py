@@ -56,8 +56,13 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
 MIN_CHARS = 80
 MAX_CHARS = 60_000
-# Per check / rewrite. Keeps a single request inside free-tier limits.
+# Per check. Detection is cheap (compact labels), so long texts are fine.
 MAX_WORDS = 2500
+# Per rewrite on paid plans. A rewrite costs ~6-10x the tokens of a check
+# (prompt + rewritten text + validation retry + second pass + re-score), and
+# Groq's free plan allows ~8K tokens per minute per model, so 1,500 words is
+# about the most that finishes in one go on free keys. Raise it with paid keys.
+MAX_REWRITE_WORDS = int(os.environ.get("MAX_REWRITE_WORDS", "1500"))
 MIN_KEY_LENGTH = 12
 
 # Whole-scan budget. The browser aborts at 240 s, so the server stops first

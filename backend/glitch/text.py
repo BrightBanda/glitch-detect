@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -13,6 +14,39 @@ WS_RE = re.compile(r"\s+")
 
 LABELS = ("AI", "REFINED", "HUMAN")
 CSS_CLASS = {"AI": "ai", "REFINED": "refined", "HUMAN": "human"}
+
+
+# Lookalike letters from other scripts, used to dodge detectors or by accident
+# (pasted from PDFs). Mapped only inside otherwise-Latin words.
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j",
+    "ѕ": "s", "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P",
+    "С": "C", "Т": "T", "Х": "X", "ο": "o", "Ο": "O", "α": "a", "ν": "v",
+})
+_MIXED_WORD_RE = re.compile(r"\w*[A-Za-z]\w*")
+_DASHES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u00ad": ""})
+
+
+def normalize_text(text: str) -> str:
+    """Clean pasted text the way detectors do (reports/How AI humanizers work.md).
+
+    NFKC (fullwidth letters, ligatures), drop invisible format characters
+    (zero-width spaces/joiners, BOM, soft hyphens), plain hyphens, and map
+    lookalike Cyrillic/Greek letters inside Latin words. Line breaks and
+    ordinary punctuation are kept, so paragraphs survive.
+    """
+    text = unicodedata.normalize("NFKC", text or "").translate(_DASHES)
+    text = "".join(
+        ch for ch in text if ch in "\n\t" or unicodedata.category(ch) not in ("Cf", "Cc")
+    )
+    return _MIXED_WORD_RE.sub(lambda m: m.group(0).translate(_CONFUSABLES), text)
+
+
+def has_hidden_characters(text: str) -> bool:
+    """Invisible format characters or lookalike letters (a red flag to detectors)."""
+    if any(unicodedata.category(ch) == "Cf" for ch in text):
+        return True
+    return any(m.group(0) != m.group(0).translate(_CONFUSABLES) for m in _MIXED_WORD_RE.finditer(text))
 
 
 @dataclass

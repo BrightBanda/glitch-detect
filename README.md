@@ -107,8 +107,29 @@ using about 7K tokens with Extra polish (about 3.5K without). The same claims
 with real, specific details scored 0%, which is why the UI points users to the
 grounding tips.
 
-Both features are limited to **2,500 words** per request (`MAX_WORDS` in
-`backend/glitch/config.py`); the UI warns live and the server enforces it.
+Both features are capped at **2,500 words** per request (`MAX_WORDS` in
+`backend/glitch/config.py`), and each plan sets its own lower limit (below).
+
+**Accounts and plans** (BUSINESS_MODEL.md §6, enforced server-side in
+`backend/glitch/users.py` + `api.py`):
+
+| | Guest | Free account | Premium | Family (5 seats) |
+|---|---|---|---|---|
+| Words per request | 500 | 500 | 2,500 | 2,500 |
+| Checks per day (fair use) | 100 | 100 | 500 | 500 |
+| Rewrites per day | — (sign in) | 5 | 15 | 15 |
+| Tones | — | Natural, Academic | all 6 | all 6 |
+
+- Checking works without an account; Humanize needs one.
+- Quotas are reserved atomically before the model call and released if it
+  fails; a "Try another version" counts as a rewrite. Days reset at 00:00 CAT.
+- Subscription states: `free`, `pending_payment`, `active`, `grace` (48 h after
+  the end date), `expired`, `cancelled` (keeps access until the end date).
+  Time-based changes are applied whenever an account is read.
+- **Payments aren't connected yet.** An admin grants Premium/Family from the
+  dashboard's Users view (or sets an open-ended plan).
+- Not built yet: PayChangu checkout, renewal notifications, ads, family seat
+  invitations.
 
 ---
 
@@ -173,9 +194,13 @@ runs them in its worker thread pool.
 | `backend/glitch/analyzer.py` | Detection: jobs, sentence/section caches, scoring |
 | `backend/glitch/humanize.py` | Rewrite: passages, notes, validation, re-scoring, second pass |
 | `backend/glitch/style.py` | Zero-token style analysis: rhythm, AI phrases, voice, grounding tips |
+| `backend/glitch/users.py` | Accounts, sessions, plans, subscription states, daily quotas (SQLite) |
+| `backend/glitch/analytics.py` | Anonymous usage counters and active-browser counts |
 | `frontend/index.html` | Sidebar app: Check text, Humanize, Settings, Account |
 | `frontend/static/style.css` | Design tokens, highlight classes, layout |
-| `frontend/static/app.js` | Routing, settings/keys, checks, rewrites, plain-language errors |
+| `frontend/static/app.js` | Routing, settings/keys, checks, rewrites, account, plain-language errors |
+| `frontend/admin.html` | Admin console: token gate, API keys, users, analytics, providers |
+| `frontend/static/admin.js` · `admin.css` | Admin console behaviour and admin-only styles |
 | `backend/tests/test_glitch.py` | Unit + API tests (offline: network is blocked in tests) |
 | `backend/tests/stub_provider.py` | FastAPI provider double for E2E checks (labels, rewrites, 429s) |
 
@@ -204,7 +229,7 @@ entry in `backend/glitch/providers.py`:
 |---|---|---|---|
 | OpenRouter | `sk-or-…` | free | `:free` models only |
 | Groq | `gsk_…` | free | documented Free Plan list |
-| Google Gemini | `AIza…` | free tier | anything its `/models` lists |
+| Google Gemini | `AIza…` or `AQ.…` (newer AI Studio keys; sent as `x-goog-api-key`, Bearer as fallback) | free tier | anything its `/models` lists |
 | Cerebras | `csk-…` | free tier | 〃 |
 | Mistral | 32 letters/digits | free tier | 〃 |
 | OpenAI | `sk-proj-…`, `sk-…` | paid | 〃 |
@@ -234,24 +259,45 @@ didn't select.
 env var names, billing, and (optionally) curated models and reasoning-model
 patterns. Nothing else changes.
 
-### Admin API (for a future dashboard)
+### Admin dashboard
 
-Disabled unless `ADMIN_TOKEN` is set; every call needs
-`Authorization: Bearer $ADMIN_TOKEN`. Building the dashboard? Start with
-[docs/ADMIN_DASHBOARD.md](docs/ADMIN_DASHBOARD.md).
+Set `ADMIN_TOKEN` in `.env`, restart, then open
+[http://127.0.0.1:8501/admin](http://127.0.0.1:8501/admin). The page asks for the
+token once and keeps it in `sessionStorage` for that tab only; **Sign out**
+clears it.
+
+| View | What it does |
+|---|---|
+| **API keys** | Paste any supported key; the service is recognised and checked automatically. Masked listing, remove admin-added keys. |
+| **Users** | Search and filter accounts; see plan, status and today's usage; grant Premium/Family for N days; change plan/status/notes; reset today's usage; sign out everywhere; suspend; delete; add an account. |
+| **Analytics** | Last 30 days of checks, rewrites, tokens and errors by action and service; anonymous active browsers; accounts by plan and status. |
+| **Providers** | Which services are ready and how each bills. |
+
+Admin API (disabled unless `ADMIN_TOKEN` is set; every call needs
+`Authorization: Bearer $ADMIN_TOKEN`):
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/admin/keys` | All keys (masked) with source, plus provider readiness |
 | `POST` | `/api/admin/keys` | `{key, label?}` → recognised, verified, stored; `201` |
 | `DELETE` | `/api/admin/keys/<id>` | Remove a stored key (env keys are read-only) |
+| `GET` | `/api/admin/analytics` | Usage windows, 30-day series, active browsers, account counts |
+| `GET` | `/api/admin/users?q=&plan=&status=&limit=&offset=` | Accounts with plan limits and today's usage |
+| `POST` | `/api/admin/users` | `{email, password, name?}` → create an account; `201` |
+| `GET` | `/api/admin/users/<id>` | One account plus 30-day usage history |
+| `PATCH` | `/api/admin/users/<id>` | `{plan?, status?, period_end?, clear_period?, suspended?, name?, notes?}` |
+| `POST` | `/api/admin/users/<id>/grant` | `{plan: premium\|family, days}` → active, extended from the current end |
+| `POST` | `/api/admin/users/<id>/reset-usage` | Clear today's checks and rewrites |
+| `POST` | `/api/admin/users/<id>/sign-out` | End all of the account's sessions |
+| `DELETE` | `/api/admin/users/<id>` | Delete the account and its usage history |
 
 ```bash
-curl -s -X POST http://127.0.0.1:8501/api/admin/keys \
+curl -s -X POST http://127.0.0.1:8501/api/admin/users/<id>/grant \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"key":"AIza…","label":"team Gemini"}'
-# → {"ok":true,"key":{"provider":"gemini","key":"AIza…abcd","verified":true,…}}
+  -d '{"plan":"premium","days":30}'
 ```
+
+Design notes for further admin work: [docs/ADMIN_DASHBOARD.md](docs/ADMIN_DASHBOARD.md).
 
 ---
 
@@ -266,6 +312,10 @@ curl -s -X POST http://127.0.0.1:8501/api/admin/keys \
 | `POST` | `/api/keys/identify` | `{key}` → `{provider, label, verified}`; nothing stored |
 | `POST` | `/api/models` | `{provider, api_keys?, force?}` → ranked model list |
 | `POST` | `/api/analyze` | `{text, provider, model, api_keys?, …options}` → score, sentences, HTML |
+| `GET` | `/api/me` | Current account (or guest), plan limits, today's usage |
+| `POST` | `/api/auth/signup` · `/api/auth/login` | `{email, password, name?}` → account + session cookie |
+| `POST` | `/api/auth/logout` | End this session |
+| `PATCH` | `/api/me` · `POST` `/api/me/password` · `POST` `/api/me/delete` | Rename, change password (signs out other devices), delete own account |
 | `POST` | `/api/humanize` | `{text, provider, model, api_keys?, tone?, voice?, only_flagged?, second_pass?, fresh?, labels?, …options}` → rewritten text, HTML, changes, before/after score and style, grounding tips |
 
 Options shared by analyze and humanize: `chunk_words`, `concurrency`,
@@ -296,6 +346,17 @@ curl -s http://127.0.0.1:8501/api/humanize -H 'Content-Type: application/json' \
 - Caches hold SHA-256 fingerprints of text; client-supplied labels are never
   written into the shared cache.
 - API keys are not logged; failures log only status codes and messages.
+- **Accounts** live in `instance/glitch.db` (owner-only permissions; schema
+  versioned with `PRAGMA user_version`). Passwords use scrypt with a per-user
+  salt; session cookies are random, HttpOnly, `SameSite=Lax`, and only their
+  SHA-256 is stored. Repeated failed sign-ins are throttled. Suspending an
+  account ends its sessions.
+- Error responses carry an optional `code` (`auth_required`, `quota`,
+  `plan_words`, `plan_tone`, `suspended`, …) so the UI can explain plan limits
+  separately from provider problems.
+- **Analytics** store only per-day counters and random browser IDs
+  (`glitch_visitor` cookie) in `instance/analytics.json` — never text, keys,
+  IPs or user agents. Admin and bootstrap routes aren't counted.
 
 ---
 
@@ -337,12 +398,25 @@ total tokens), and `models_used`; the server log prints them per scan.
 
 ### Rate limits and fallback
 
+`glitch/limits.py` learns each provider's limits from its response headers
+(Groq `x-ratelimit-remaining-tokens` / `-reset-tokens`, OpenRouter
+`X-RateLimit-Remaining` / `-Reset`):
+
+- **Pacing**: a model that can't fit the next request is skipped, and jobs are
+  load-balanced across the provider's top models (Groq 3, OpenRouter 2).
+- **Daily caps**: a 429 naming a per-day limit blocks that model, or all of
+  OpenRouter's free models (the cap is account-wide), until the reset instead
+  of being retried on every scan.
+- **Patience**: when every model is busy for a per-minute window (≤ 65 s) and the
+  deadline allows, the job waits for the soonest one instead of failing. Longer
+  waits fail fast with "Every free model is busy… try again in N minutes".
+- Network errors fall back to another model instead of ending the scan.
+
 With **auto-switch** on (default, Settings → Rate limits):
 
-- A `429`, `404`, repeated `5xx`, timeout, or empty/reasoning-only reply retires
-  that model for the rest of the scan; every chunk moves to the next candidate
-  **without sleeping**. A chunk the model can't format as JSON is retried on the
-  next model too.
+- A `404`, repeated `5xx`, timeout, or empty/reasoning-only reply retires
+  that model for the rest of the scan; a `429` cools it down. A chunk the model
+  can't format as JSON is retried on the next model too.
 - Candidates: the selected model, then the provider's recommended free models
   (never guardrail classifiers), then — if allowed and a key exists — the top
   models of the other provider.
@@ -385,6 +459,20 @@ GROQ_BASE_URL=http://127.0.0.1:8599/v1 \
 OPENROUTER_API_KEY=sk-or-stub-key-0000 \
 .venv/bin/python backend/main.py
 ```
+
+### Humanizer evaluation
+
+`backend/eval/humanize_eval.py` measures the humanizer against real providers
+(see reports/How AI humanizers work.md, Phase 0). From `backend/`:
+
+```bash
+../.venv/bin/python -m eval.humanize_eval corpus                 # 8 AI passages, once
+../.venv/bin/python -m eval.humanize_eval run --label mine --runs 2
+../.venv/bin/python -m eval.humanize_eval compare baseline-v3 mine
+```
+
+It records the app's own detector score (a proxy, not an external detector),
+lost and invented facts, content overlap, rhythm, AI phrases, tokens and time.
 
 ---
 

@@ -207,6 +207,10 @@ def rewrite_notes(passage: str, *, document_rhythm: float | None = None) -> list
         notes.append("Don't open sentences with linking words like Moreover, Additionally or Ultimately.")
     if sentences and len(_HEDGE_RE.findall(passage)) / len(sentences) > 0.8:
         notes.append("Hedge only where something is genuinely uncertain.")
+    names, numbers = names_and_numbers(passage)
+    if names or numbers:
+        keep = sorted(numbers, key=lambda n: passage.find(n)) + sorted(names, key=lambda n: passage.find(n))
+        notes.append("Keep exactly: " + ", ".join(keep) + ".")
     return notes
 
 
@@ -236,19 +240,90 @@ def voice_markers(text: str) -> set[str]:
     return found
 
 
+# First-person *experience* claims (not opinions): "I think" is stance and is
+# fine; "when I worked at…" is a made-up fact unless the writer supplied it.
+_CLAIM_RE = re.compile(
+    r"\b(?:I remember|I recall|in my (?:own )?experience|I(?:'ve| have) (?:seen|watched|worked|tried|met|lived)|"
+    r"I once|I used to|when I (?:was|worked|tried|started|lived|visited|first|moved)|"
+    r"(?:a|one) (?:friend|colleague|client|student) of mine|my (?:friend|colleague|boss|teacher|"
+    r"mom|mum|dad|sister|brother|cousin|neighbou?r|manager|professor)|last (?:year|month|week|summer))\b",
+    re.IGNORECASE,
+)
+_UNITS = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+def _number_words(number: str) -> str | None:
+    """'25' → 'twenty-five' (0–99), for matching numbers a rewrite spelled out."""
+    if not number.isdigit() or int(number) > 99:
+        return None
+    n = int(number)
+    if n < 20:
+        return _UNITS[n]
+    return _TENS[n // 10] + ("" if n % 10 == 0 else "-" + _UNITS[n % 10])
+
+
+def _bare(number: str) -> str:
+    return number.rstrip("%").rstrip(".,")
+
+
+def _number_present(number: str, text: str) -> bool:
+    """Is ``number`` in ``text`` as digits (ignoring a % sign) or spelled out?"""
+    if re.search(rf"(?<![\d.,]){re.escape(_bare(number))}(?![\d])", text):
+        return True
+    words = _number_words(_bare(number))
+    return bool(words) and re.search(rf"\b{words.replace('-', '[- ]')}\b", text, re.IGNORECASE) is not None
+
+
+def _name_present(name: str, lowered: str) -> bool:
+    """Case- and hyphen-insensitive ("Gen Z" vs "Gen-Z", "TikTok" vs "Tiktok")."""
+    return name.lower() in lowered or name.lower() in lowered.replace("-", " ")
+
+
+def invented(before: str, after: str, allowed: str = "") -> list[str]:
+    """New particulars in a rewrite that neither the source nor the author supplied.
+
+    ``allowed`` is author-supplied text (grounding answers): its names, numbers
+    and experiences are fair game. Returns feedback lines (empty if clean).
+    """
+    source = f"{before}\n{allowed}"
+    lowered = source.lower()
+    names_src, numbers_src = names_and_numbers(source)
+    names_new, numbers_new = names_and_numbers(after)
+    numbers = sorted(n for n in numbers_new if not _number_present(n, source))
+    names = sorted(n for n in names_new if not _name_present(n, lowered))
+    claims = sorted({m.group(0) for m in _CLAIM_RE.finditer(after) if m.group(0).lower() not in lowered})
+    problems = []
+    if numbers:
+        problems.append("Don't add numbers that aren't in the original: " + ", ".join(numbers) + ".")
+    if names:
+        problems.append("Don't add names that aren't in the original: " + ", ".join(names) + ".")
+    if claims:
+        problems.append(
+            "Don't invent personal experiences (" + ", ".join(f"“{c}”" for c in claims)
+            + "). Give an opinion instead, or keep it general."
+        )
+    return problems
+
+
 def check_rewrite(
-    before: str, after: str, *, voice: str = "faithful"
+    before: str, after: str, *, voice: str = "faithful", allowed: str = ""
 ) -> tuple[list[str], list[str]]:
-    """Free validation of a rewrite: (lost facts, remaining style problems)."""
+    """Free validation of a rewrite: (fact problems, remaining style problems).
+
+    Fact problems — lost names/numbers, or invented ones — mean the rewrite
+    can't be used as is; style problems only earn a retry.
+    """
     names_before, numbers_before = names_and_numbers(before)
     lowered = after.lower()
     lost: list[str] = []
-    missing_numbers = sorted(n for n in numbers_before if n not in after)
+    missing_numbers = sorted(n for n in numbers_before if not _number_present(n, after))
     if missing_numbers:
         lost.append("Keep these numbers exactly: " + ", ".join(missing_numbers) + ".")
-    missing_names = sorted(n for n in names_before if n.lower() not in lowered)
+    missing_names = sorted(n for n in names_before if not _name_present(n, lowered))
     if missing_names:
         lost.append("Keep these names exactly: " + ", ".join(missing_names) + ".")
+    lost += invented(before, after, allowed)
 
     problems: list[str] = []
     words = lexicon_hits(after)
@@ -272,6 +347,38 @@ def check_rewrite(
             "sentence (2–6 words) and one long one (25+)."
         )
     return lost, problems
+
+
+# Generic claims → the question only the writer can answer (Phase 1).
+_QUESTIONS = (
+    (re.compile(r"\b(stud(?:y|ies)|research(?:ers)?|surveys?|reports?|data|evidence)\b", re.I),
+     "Which study, report or source do you mean?"),
+    (re.compile(r"\b(experts?|scientists?|analysts?|specialists?|professionals?)\b", re.I),
+     "Who said it? A name, or the kind of person?"),
+    (re.compile(r"\b(many|most|several|numerous|countless|a (?:growing )?number of|significant(?:ly)?|"
+                r"increasing(?:ly)?|widespread)\b", re.I),
+     "Roughly how many or how much? A figure you know is enough."),
+    (re.compile(r"\b(recent(?:ly)?|nowadays|today|in recent years|modern)\b", re.I),
+     "When, roughly? A year or period?"),
+    (re.compile(r"\b(businesses|companies|organi[sz]ations|schools|cities|countries|communities|people|users|students)\b", re.I),
+     "Which one? A place, company or group you have in mind?"),
+)
+_EXAMPLE_QUESTION = "One example you've seen or done yourself?"
+
+
+def grounding_questions(passage: str, limit: int = 3) -> list[str]:
+    """Up to ``limit`` short questions asking for the particulars a passage lacks.
+
+    Zero tokens. Passages that already name things or give numbers get fewer
+    questions; every answer is optional.
+    """
+    names, numbers = names_and_numbers(passage)
+    questions = [q for pattern, q in _QUESTIONS if pattern.search(passage)]
+    if numbers:
+        questions = [q for q in questions if not q.startswith("Roughly")]
+    if not (names or numbers) or len(questions) < limit:
+        questions.append(_EXAMPLE_QUESTION)
+    return list(dict.fromkeys(questions))[:limit]
 
 
 def grounding_tips(text: str, limit: int = 3) -> list[dict]:

@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin — Glitch//Detect</title>
+<meta name="description" content="Manage this Glitch//Detect server's API keys, users and plans.">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230D0D11'/%3E%3Cpath d='M6 8h8v4H6zm12 0h8v4h-8zM6 14h20v4H6zm0 6h8v4H6zm12 0h8v4h-8z' fill='%2322D3EE'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;900&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+<script src="/static/admin.js" defer></script>
+</head>
+<body>
+<div class="bg-grid" aria-hidden="true"></div>
+
+<!-- ───────────────────────── sign-in gate ───────────────────────── -->
+<main class="admin-gate" id="gate">
+  <section class="panel gate-card" aria-labelledby="gateTitle">
+    <a class="sb-brand gate-brand" href="/" aria-label="Back to Glitch//Detect">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span class="glitch" data-text="GLITCH//DETECT">GLITCH//DETECT</span>
+    </a>
+
+    <p class="eyebrow">Admin console</p>
+    <h1 id="gateTitle">Admin access</h1>
+    <p class="gate-sub">Enter this server's admin token to manage its keys, users and plans.</p>
+
+    <label class="field-label" for="adminToken">Admin token</label>
+    <div class="token-row">
+      <input id="adminToken" type="password" autocomplete="off" spellcheck="false"
+             aria-describedby="tokenHint" placeholder="Paste the admin token">
+      <button class="mini-btn" type="button" id="toggleToken" aria-label="Show token">Show</button>
+    </div>
+    <p class="hint" id="tokenHint">Kept in this tab only. Closing the tab signs you out.</p>
+
+    <button class="btn-primary gate-submit" type="button" id="signInBtn">
+      <span class="btn-label">SIGN IN</span>
+      <span class="btn-loading"><i></i> SIGNING IN…</span>
+    </button>
+
+    <div class="alert gate-alert" id="gateAlert" role="alert" hidden>
+      <div class="alert-head">
+        <span class="alert-icon" aria-hidden="true">!</span>
+        <div class="alert-body">
+          <strong class="alert-title">Something went wrong</strong>
+          <p class="alert-message"></p>
+        </div>
+        <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+      </div>
+      <details class="alert-detail-wrap" hidden>
+        <summary>Technical details</summary>
+        <pre class="alert-detail"></pre>
+      </details>
+    </div>
+
+    <p class="gate-foot"><a href="/">← Back to the app</a></p>
+  </section>
+</main>
+
+<!-- ───────────────────────── admin app ───────────────────────── -->
+<div class="shell" id="adminApp" hidden>
+  <aside class="sidebar" aria-label="Admin">
+    <a class="sb-brand" href="#keys" aria-label="Glitch//Detect admin home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span class="glitch" data-text="GLITCH//DETECT">GLITCH//DETECT</span>
+    </a>
+
+    <nav class="sb-nav" aria-label="Admin sections">
+      <a class="sb-link" href="#keys" data-view="keys">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="3.2"/><path d="M10.8 14.2 20 23.4"/><path d="m15.6 18.8 2-2"/><path d="m12.8 16 2-2"/></svg>
+        <span>API keys</span>
+      </a>
+      <a class="sb-link" href="#users" data-view="users">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c.9-3.3 3.2-5 6-5s5.1 1.7 6 5"/><path d="M16 4.6a3.2 3.2 0 0 1 0 6.3"/><path d="M18 15.3c1.6.7 2.6 2.3 3 4.7"/></svg>
+        <span>Users</span>
+      </a>
+      <a class="sb-link" href="#analytics" data-view="analytics">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-6"/><path d="M22 20H2"/></svg>
+        <span>Analytics</span>
+      </a>
+      <a class="sb-link" href="#providers" data-view="providers">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1"/><rect x="13.5" y="3.5" width="7" height="7" rx="1"/><rect x="3.5" y="13.5" width="7" height="7" rx="1"/><rect x="13.5" y="13.5" width="7" height="7" rx="1"/></svg>
+        <span>Providers</span>
+      </a>
+    </nav>
+
+    <div class="sb-foot" id="adminStatus" data-state="online">
+      <span class="pulse"></span>
+      <span id="adminStatusLabel">Admin console</span>
+    </div>
+
+    <div class="sb-admin-foot">
+      <a class="sb-link admin-back" href="/">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5"/><path d="m11 6-6 6 6 6"/></svg>
+        <span class="sb-full">Back to app</span><span class="sb-short">App</span>
+      </a>
+      <button class="sb-link admin-signout" type="button" id="signOutBtn">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H5v14h5"/><path d="m14 8 4 4-4 4"/><path d="M18 12H9"/></svg>
+        <span>Sign out</span>
+      </button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- ───────────────────────── API keys ───────────────────────── -->
+    <section class="view" id="view-keys" data-view="keys">
+      <header class="page-head">
+        <p class="eyebrow">Admin console</p>
+        <h1 tabindex="-1">API keys</h1>
+        <p class="page-sub">Paste a key and we'll recognise which service it belongs to.</p>
+      </header>
+
+      <section class="panel settings-card" aria-labelledby="addKeyTitle">
+        <div class="panel-head">
+          <h2 id="addKeyTitle">Add a key</h2>
+        </div>
+        <p class="card-sub">Paste any supported key. We'll work out which service it belongs to and check it with them.</p>
+
+        <label class="field-label" for="newAdminKey">API key</label>
+        <div class="key-row add-key-row">
+          <input id="newAdminKey" type="password" spellcheck="false" autocomplete="off"
+                 placeholder="Paste an API key" aria-describedby="addKeyHint">
+          <button class="mini-btn" type="button" id="toggleNewKey" aria-label="Show key">Show</button>
+        </div>
+
+        <label class="field-label" for="newKeyLabel">Label <span class="optional">optional</span></label>
+        <input id="newKeyLabel" type="text" maxlength="60" autocomplete="off" placeholder="e.g. team Gemini">
+        <p class="hint" id="addKeyHint">A label helps you tell keys apart. Up to 60 characters.</p>
+
+        <div class="add-key-actions">
+          <button class="btn-primary" type="button" id="addKeyBtn">
+            <span class="btn-label">ADD KEY</span>
+            <span class="btn-loading"><i></i> CHECKING…</span>
+          </button>
+          <p class="progress-note" id="addProgress" hidden>Checking this key with its service…</p>
+        </div>
+
+        <p class="key-feedback" id="addFeedback" role="status" hidden></p>
+
+        <div class="alert" id="addAlert" role="alert" hidden>
+          <div class="alert-head">
+            <span class="alert-icon" aria-hidden="true">!</span>
+            <div class="alert-body">
+              <strong class="alert-title">Something went wrong</strong>
+              <p class="alert-message"></p>
+            </div>
+            <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+          </div>
+          <details class="alert-detail-wrap" hidden>
+            <summary>Technical details</summary>
+            <pre class="alert-detail"></pre>
+          </details>
+        </div>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="keysTitle">
+        <div class="panel-head">
+          <h2 id="keysTitle">Keys on this server</h2>
+          <div class="doc-tools">
+            <span class="panel-summary" id="keySummary" aria-live="polite">Loading…</span>
+            <button class="mini-btn" type="button" id="refreshKeysBtn">Refresh</button>
+          </div>
+        </div>
+        <p class="card-sub">The newest key for a service is used first. Keys from the server's environment are read-only.</p>
+
+        <div class="alert" id="keysAlert" role="alert" hidden>
+          <div class="alert-head">
+            <span class="alert-icon" aria-hidden="true">!</span>
+            <div class="alert-body">
+              <strong class="alert-title">Something went wrong</strong>
+              <p class="alert-message"></p>
+            </div>
+            <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+          </div>
+          <details class="alert-detail-wrap" hidden>
+            <summary>Technical details</summary>
+            <pre class="alert-detail"></pre>
+          </details>
+        </div>
+
+        <p class="key-feedback" id="keysFeedback" role="status" hidden></p>
+        <div id="keyGroups"></div>
+
+        <div class="admin-empty" id="keysEmpty" hidden>
+          <p class="empty-title">No keys yet.</p>
+          <p class="hint">Paste any supported key above — we'll work out which service it belongs to.</p>
+        </div>
+
+        <p class="hint" id="keysUsageHint">The key marked <span class="badge" data-tone="in-use">In use</span> is tried first for new checks.</p>
+      </section>
+    </section>
+
+    <!-- ───────────────────────── users ───────────────────────── -->
+    <section class="view" id="view-users" data-view="users" hidden>
+      <header class="page-head">
+        <p class="eyebrow">Admin console</p>
+        <h1 tabindex="-1">Users</h1>
+        <p class="page-sub">Accounts, plans and today's usage. Payments aren't connected yet, so plans are granted here.</p>
+      </header>
+
+      <section class="panel settings-card" aria-labelledby="usersTitle">
+        <div class="panel-head">
+          <h2 id="usersTitle">Accounts</h2>
+          <div class="doc-tools">
+            <span class="panel-summary" id="usersSummary" aria-live="polite">Loading…</span>
+            <button class="mini-btn" type="button" id="refreshUsersBtn">Refresh</button>
+          </div>
+        </div>
+
+        <div class="user-filters">
+          <div>
+            <label class="field-label" for="userSearch">Search</label>
+            <input id="userSearch" type="search" autocomplete="off" spellcheck="false" placeholder="Email or name">
+          </div>
+          <div>
+            <label class="field-label" for="userPlanFilter">Plan</label>
+            <select id="userPlanFilter">
+              <option value="">All plans</option>
+              <option value="free">Free</option>
+              <option value="premium">Premium</option>
+              <option value="family">Family</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="userStatusFilter">Status</label>
+            <select id="userStatusFilter">
+              <option value="">Any status</option>
+              <option value="free">Free</option>
+              <option value="pending_payment">Pending payment</option>
+              <option value="active">Active</option>
+              <option value="grace">Grace period</option>
+              <option value="expired">Expired</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="alert" id="usersAlert" role="alert" hidden>
+          <div class="alert-head">
+            <span class="alert-icon" aria-hidden="true">!</span>
+            <div class="alert-body">
+              <strong class="alert-title">Something went wrong</strong>
+              <p class="alert-message"></p>
+            </div>
+            <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+          </div>
+          <details class="alert-detail-wrap" hidden>
+            <summary>Technical details</summary>
+            <pre class="alert-detail"></pre>
+          </details>
+        </div>
+        <p class="key-feedback" id="usersFeedback" role="status" hidden></p>
+
+        <div class="table-wrap">
+          <table class="analytics-table users-table">
+            <thead>
+              <tr><th scope="col">Account</th><th scope="col">Plan</th><th scope="col">Status</th><th scope="col">Today</th><th scope="col">Last seen</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr>
+            </thead>
+            <tbody id="userRows">
+              <tr><td colspan="6" class="table-empty">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="user-pager" id="userPager" hidden>
+          <button class="mini-btn" type="button" id="usersPrev">← Previous</button>
+          <span id="usersRange"></span>
+          <button class="mini-btn" type="button" id="usersNext">Next →</button>
+        </div>
+      </section>
+
+      <section class="panel settings-card user-detail" id="userDetail" aria-labelledby="detailTitle" hidden>
+        <div class="panel-head">
+          <h2 id="detailTitle" tabindex="-1">Account</h2>
+          <button class="mini-btn" type="button" id="closeDetail" aria-label="Close account details">Close</button>
+        </div>
+        <p class="card-sub" id="detailSub"></p>
+
+        <div class="detail-grid" id="detailFacts"></div>
+
+        <div class="alert" id="detailAlert" role="alert" hidden>
+          <div class="alert-head">
+            <span class="alert-icon" aria-hidden="true">!</span>
+            <div class="alert-body">
+              <strong class="alert-title">Something went wrong</strong>
+              <p class="alert-message"></p>
+            </div>
+            <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+          </div>
+          <details class="alert-detail-wrap" hidden>
+            <summary>Technical details</summary>
+            <pre class="alert-detail"></pre>
+          </details>
+        </div>
+        <p class="key-feedback" id="detailFeedback" role="status" hidden></p>
+
+        <h3 class="key-group-title">Grant a paid plan</h3>
+        <p class="hint">Adds days from today, or from the current end date if this plan is still running.</p>
+        <div class="detail-row">
+          <div>
+            <label class="field-label" for="grantPlan">Plan</label>
+            <select id="grantPlan">
+              <option value="premium">Premium</option>
+              <option value="family">Family</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="grantDays">Days</label>
+            <input id="grantDays" type="number" min="1" max="3660" step="1" value="30">
+          </div>
+          <button class="btn-ghost compact" type="button" id="grantBtn">Grant</button>
+        </div>
+
+        <h3 class="key-group-title">Plan, status and notes</h3>
+        <div class="detail-row">
+          <div>
+            <label class="field-label" for="editPlan">Plan</label>
+            <select id="editPlan">
+              <option value="free">Free</option>
+              <option value="premium">Premium</option>
+              <option value="family">Family</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="editStatus">Status</label>
+            <select id="editStatus">
+              <option value="free">Free</option>
+              <option value="pending_payment">Pending payment</option>
+              <option value="active">Active</option>
+              <option value="grace">Grace period</option>
+              <option value="expired">Expired</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </div>
+        </div>
+        <label class="check-row" for="editOpenEnded">
+          <input type="checkbox" id="editOpenEnded">
+          <span>No end date (keeps the plan until you change it)</span>
+        </label>
+        <label class="field-label" for="editNotes">Notes <span class="optional">admins only</span></label>
+        <textarea id="editNotes" class="notes-box" maxlength="500" rows="3" placeholder="e.g. paid by Airtel Money, ref 123"></textarea>
+        <div class="detail-actions">
+          <button class="btn-ghost compact" type="button" id="saveUserBtn">Save changes</button>
+        </div>
+
+        <h3 class="key-group-title">Account actions</h3>
+        <div class="detail-actions">
+          <button class="mini-btn" type="button" id="resetUsageBtn">Reset today's usage</button>
+          <button class="mini-btn" type="button" id="signOutUserBtn">Sign out everywhere</button>
+          <button class="mini-btn" type="button" id="suspendBtn">Suspend</button>
+          <button class="mini-btn danger" type="button" id="deleteUserBtn">Delete account</button>
+        </div>
+      </section>
+
+      <details class="panel settings-card advanced" id="addUserCard">
+        <summary><h2>Add an account</h2><span class="card-sub">For people you onboard yourself</span></summary>
+        <div class="detail-row">
+          <div>
+            <label class="field-label" for="newUserEmail">Email</label>
+            <input id="newUserEmail" type="email" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label class="field-label" for="newUserName">Name <span class="optional">optional</span></label>
+            <input id="newUserName" type="text" maxlength="60" autocomplete="off">
+          </div>
+        </div>
+        <label class="field-label" for="newUserPassword">Temporary password</label>
+        <input id="newUserPassword" type="password" autocomplete="new-password" minlength="8">
+        <p class="hint">At least 8 characters. Ask them to change it from their Account page.</p>
+        <div class="detail-actions">
+          <button class="btn-ghost compact" type="button" id="createUserBtn">Create account</button>
+        </div>
+        <p class="key-feedback" id="createUserFeedback" role="status" hidden></p>
+      </details>
+    </section>
+
+    <!-- ───────────────────────── analytics ───────────────────────── -->
+    <section class="view" id="view-analytics" data-view="analytics" hidden>
+      <header class="page-head">
+        <p class="eyebrow">Admin console</p>
+        <h1 tabindex="-1">Analytics</h1>
+        <p class="page-sub">Usage and anonymous activity on this server.</p>
+      </header>
+
+      <section class="panel settings-card" aria-labelledby="usageTitle">
+        <div class="panel-head">
+          <h2 id="usageTitle">API usage</h2>
+          <div class="doc-tools">
+            <span class="panel-summary" id="analyticsUpdated">Not loaded</span>
+            <button class="mini-btn" type="button" id="analyticsRefreshBtn">Refresh</button>
+          </div>
+        </div>
+        <p class="card-sub">The last 30 days of checks, rewrites and model calls. Page views are counted separately, and pasted text is never stored.</p>
+
+        <div class="alert" id="analyticsAlert" role="alert" hidden>
+          <div class="alert-head">
+            <span class="alert-icon" aria-hidden="true">!</span>
+            <div class="alert-body">
+              <strong class="alert-title">Something went wrong</strong>
+              <p class="alert-message"></p>
+            </div>
+            <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+          </div>
+          <details class="alert-detail-wrap" hidden>
+            <summary>Technical details</summary>
+            <pre class="alert-detail"></pre>
+          </details>
+        </div>
+
+        <div class="analytics-stats" id="analyticsStats" aria-live="polite">
+          <div class="analytics-stat">
+            <span class="analytics-label">API requests</span>
+            <strong id="statApi">—</strong>
+            <span class="analytics-note">checks, rewrites and model calls</span>
+          </div>
+          <div class="analytics-stat">
+            <span class="analytics-label">Checks</span>
+            <strong id="statChecks">—</strong>
+            <span class="analytics-note">AI-writing analyses</span>
+          </div>
+          <div class="analytics-stat">
+            <span class="analytics-label">Rewrites</span>
+            <strong id="statRewrites">—</strong>
+            <span class="analytics-note">humanizer requests</span>
+          </div>
+          <div class="analytics-stat">
+            <span class="analytics-label">Tokens</span>
+            <strong id="statTokens">—</strong>
+            <span class="analytics-note">reported by the AI services</span>
+          </div>
+        </div>
+        <p class="hint" id="analyticsEmpty" hidden>No usage yet. Run a check or rewrite in the app, then refresh here.</p>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="activeTitle">
+        <div class="panel-head">
+          <h2 id="activeTitle">Active users</h2>
+          <span class="badge" data-tone="count">Anonymous browsers</span>
+        </div>
+        <p class="card-sub">Unique browsers that opened the app or made a request, signed in or not. Accounts are counted under “Accounts and plans” below.</p>
+
+        <div class="analytics-active">
+          <div class="analytics-active-item">
+            <strong id="activeDay">—</strong>
+            <span>Daily</span>
+            <small>Today</small>
+          </div>
+          <div class="analytics-active-item">
+            <strong id="activeWeek">—</strong>
+            <span>Weekly</span>
+            <small>Last 7 days</small>
+          </div>
+          <div class="analytics-active-item">
+            <strong id="activeMonth">—</strong>
+            <span>Monthly</span>
+            <small>Last 30 days</small>
+          </div>
+          <div class="analytics-active-item">
+            <strong id="activeYear">—</strong>
+            <span>Yearly</span>
+            <small>Last 365 days</small>
+          </div>
+        </div>
+        <p class="hint" id="activeNote">New this month: — · Seen all time: —</p>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="trendTitle">
+        <div class="panel-head">
+          <h2 id="trendTitle">Last 30 days</h2>
+          <div class="chart-legend" aria-hidden="true">
+            <span class="legend-dot calls"></span> API calls
+            <span class="legend-dot active"></span> Active browsers
+          </div>
+        </div>
+        <p class="card-sub">Each day shows API calls beside the number of active browsers.</p>
+        <div class="analytics-chart" id="usageChart" role="img" aria-label="Daily API usage and active browsers for the last 30 days"></div>
+        <div class="chart-axis" aria-hidden="true">
+          <span id="chartStart">—</span>
+          <span id="chartMax">—</span>
+          <span id="chartEnd">—</span>
+        </div>
+        <p class="hint" id="chartEmpty" hidden>No usage in the last 30 days.</p>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="breakdownTitle">
+        <div class="panel-head">
+          <h2 id="breakdownTitle">Where the usage goes</h2>
+        </div>
+        <p class="card-sub">Last 30 days, grouped by action and AI service.</p>
+        <div class="analytics-tables">
+          <div class="table-wrap">
+            <h3 class="key-group-title">By action</h3>
+            <table class="analytics-table">
+              <thead>
+                <tr><th scope="col">Action</th><th scope="col">Calls</th><th scope="col">Errors</th><th scope="col">Avg time</th></tr>
+              </thead>
+              <tbody id="endpointRows">
+                <tr><td colspan="4" class="table-empty">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap">
+            <h3 class="key-group-title">By service</h3>
+            <table class="analytics-table">
+              <thead>
+                <tr><th scope="col">Service</th><th scope="col">Calls</th><th scope="col">Tokens</th><th scope="col">Errors</th></tr>
+              </thead>
+              <tbody id="providerRows">
+                <tr><td colspan="4" class="table-empty">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="billingTitle">
+        <div class="panel-head">
+          <h2 id="billingTitle">Accounts and plans</h2>
+          <span class="badge" data-tone="warn" id="paymentsBadge">Payments not connected</span>
+        </div>
+        <p class="card-sub">Registered accounts by effective plan. Paid plans are granted from the Users view until payments are connected.</p>
+        <div class="analytics-active">
+          <div class="analytics-active-item">
+            <strong id="acctTotal">—</strong>
+            <span>Accounts</span>
+            <small>All time</small>
+          </div>
+          <div class="analytics-active-item">
+            <strong id="acctPaid">—</strong>
+            <span>Paid</span>
+            <small>Premium and Family</small>
+          </div>
+          <div class="analytics-active-item">
+            <strong id="acctFree">—</strong>
+            <span>Free</span>
+            <small>Including expired</small>
+          </div>
+          <div class="analytics-active-item">
+            <strong id="acctNew">—</strong>
+            <span>New</span>
+            <small>Last 30 days</small>
+          </div>
+        </div>
+        <p class="hint" id="acctNote">Active today: — · Suspended: —</p>
+      </section>
+    </section>
+
+    <!-- ───────────────────────── providers ───────────────────────── -->
+    <section class="view" id="view-providers" data-view="providers" hidden>
+      <header class="page-head">
+        <p class="eyebrow">Admin console</p>
+        <h1 tabindex="-1">Providers</h1>
+        <p class="page-sub">Which services the server can use, and how each one bills.</p>
+      </header>
+
+      <section class="panel settings-card" aria-labelledby="providersTitle">
+        <div class="panel-head">
+          <h2 id="providersTitle">Available services</h2>
+          <div class="doc-tools">
+            <span class="panel-summary" id="providerSummary" aria-live="polite">Loading…</span>
+            <button class="mini-btn" type="button" id="refreshProvidersBtn">Refresh</button>
+          </div>
+        </div>
+        <p class="card-sub">Readiness follows the keys you've added. Free tiers can still have daily limits.</p>
+
+        <div class="alert" id="providersAlert" role="alert" hidden>
+          <div class="alert-head">
+            <span class="alert-icon" aria-hidden="true">!</span>
+            <div class="alert-body">
+              <strong class="alert-title">Something went wrong</strong>
+              <p class="alert-message"></p>
+            </div>
+            <button class="mini-btn alert-close" type="button" aria-label="Dismiss">✕</button>
+          </div>
+          <details class="alert-detail-wrap" hidden>
+            <summary>Technical details</summary>
+            <pre class="alert-detail"></pre>
+          </details>
+        </div>
+
+        <ul class="provider-list" id="providerList" aria-label="AI services"></ul>
+        <p class="hint" id="providersEmpty" hidden>No services are configured on this server.</p>
+      </section>
+    </section>
+
+    <footer class="footer">GLITCH//DETECT · Admin console</footer>
+  </main>
+</div>
+</body>
+</html>

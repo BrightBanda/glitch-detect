@@ -177,9 +177,14 @@
         <p class="page-sub">We rewrite only the sentences that read as AI-written, and leave the rest of your words alone.</p>
       </header>
 
+      <div class="notice account-nudge" id="rewriteNudge" hidden>
+        <strong>Rewriting needs a free account.</strong>
+        Free accounts get 5 rewrites a day. <a href="#account">Create one or sign in →</a>
+      </div>
+
       <section class="panel editor-panel" id="humanizePanel">
         <div class="panel-head">
-          <h2>Your draft</h2>
+          <h2>Your draft <span class="rewrites-left" id="rewritesLeft" hidden></span></h2>
           <button class="mini-btn" id="useLastCheck" type="button" hidden>Use my last check</button>
         </div>
         <div class="textarea-shell">
@@ -223,6 +228,17 @@
           </label>
         </div>
 
+        <details class="grounding" id="groundingBox">
+          <summary><strong>Add details only you know</strong> <span class="optional">optional, recommended</span></summary>
+          <p class="hint">
+            A real name, number, date or example is the strongest sign of a human writer, and only you can give it.
+            Your answers are the only new facts a rewrite may add; nothing else is made up.
+          </p>
+          <button class="mini-btn" id="askQuestions" type="button">Suggest questions for my draft</button>
+          <p class="hint" id="questionsEmpty" hidden>Nothing to ask: your draft already has specific details.</p>
+          <div class="question-list" id="questionList"></div>
+        </details>
+
         <div class="editor-actions">
           <button class="btn-primary" id="humanizeBtn" type="button">
             <span class="btn-label">REWRITE</span>
@@ -253,6 +269,7 @@
           <div class="doc-tools">
             <button class="mini-btn" id="tryAgain" type="button">Try another version</button>
             <button class="mini-btn" id="copyRewrite" type="button">Copy</button>
+            <button class="mini-btn" id="downloadTrail" type="button" title="What you wrote, what was rewritten, and the details you added">Download record</button>
             <button class="mini-btn accent" id="checkRewrite" type="button">Check this text →</button>
           </div>
         </div>
@@ -287,8 +304,10 @@
       </section>
 
       <p class="disclaimer">
-        Rewrites can change nuance. Read the result before using it, and be honest about how
-        your writing was produced where that matters, such as school or work.
+        Rewrites can change nuance. Read the result before using it. For school or work, follow
+        your institution's AI policy and say you had help where that's expected. “Download record”
+        saves what you wrote, what was rewritten and the details you added. It's useful evidence
+        of your own work.
       </p>
     </section>
 
@@ -397,8 +416,8 @@
     <section class="view" id="view-account" data-view="account" hidden>
       <header class="page-head">
         <p class="eyebrow">Account</p>
-        <h1>Your profile</h1>
-        <p class="page-sub">No sign-up needed. Everything stays on this computer.</p>
+        <h1>Your account</h1>
+        <p class="page-sub" id="accountSub">Checking works without an account. A free account adds rewrites.</p>
       </header>
 
       <section class="panel settings-card profile-card">
@@ -406,7 +425,7 @@
         <div class="profile-body">
           <label class="field-label" for="displayName">Your name</label>
           <input id="displayName" type="text" maxlength="40" autocomplete="nickname" placeholder="What should we call you?">
-          <p class="hint">Only used to greet you.</p>
+          <p class="hint" id="nameHint">Only used to greet you.</p>
         </div>
       </section>
 
@@ -419,10 +438,87 @@
         </div>
       </section>
 
-      <section class="panel settings-card">
-        <h2>Sign in &amp; sync <span class="soon-tag">SOON</span></h2>
-        <p class="card-sub">Save your history and settings across devices.</p>
-        <button class="btn-ghost" type="button" disabled>Sign in</button>
+      <section class="panel settings-card" id="authCard" aria-labelledby="authTitle">
+        <h2 id="authTitle">Create a free account</h2>
+        <p class="card-sub">Rewrite up to 5 passages a day, and keep your plan on any device.</p>
+        <div class="mode-tabs auth-tabs" role="tablist" aria-label="Account">
+          <button class="mode-tab active" type="button" role="tab" aria-selected="true" data-auth="signup">Create account</button>
+          <button class="mode-tab" type="button" role="tab" aria-selected="false" data-auth="login">Sign in</button>
+        </div>
+        <label class="field-label" for="authEmail">Email</label>
+        <input id="authEmail" type="email" autocomplete="email" spellcheck="false">
+        <div id="authNameRow">
+          <label class="field-label" for="authName">Name <span class="optional">optional</span></label>
+          <input id="authName" type="text" maxlength="60" autocomplete="name">
+        </div>
+        <label class="field-label" for="authPassword">Password</label>
+        <input id="authPassword" type="password" autocomplete="new-password">
+        <p class="hint" id="authHint">At least 8 characters.</p>
+        <div class="editor-actions">
+          <button class="btn-primary" id="authSubmit" type="button">
+            <span class="btn-label">CREATE ACCOUNT</span>
+            <span class="btn-loading"><i></i> ONE MOMENT<span class="dots"></span></span>
+          </button>
+        </div>
+        <p class="key-feedback" id="authFeedback" role="status" hidden></p>
+      </section>
+
+      <section class="panel settings-card" id="planCard" aria-labelledby="planTitle" hidden>
+        <div class="panel-head">
+          <h2 id="planTitle">Your plan</h2>
+          <span class="badge plan-badge" id="planBadge">Free</span>
+        </div>
+        <p class="card-sub" id="planLine"></p>
+        <div class="usage-grid">
+          <div class="usage"><strong id="usageChecks">0</strong><span id="usageChecksLabel">checks today</span></div>
+          <div class="usage"><strong id="usageRewrites">0</strong><span id="usageRewritesLabel">rewrites today</span></div>
+          <div class="usage"><strong id="usageWords">500</strong><span>words per check</span></div>
+          <div class="usage"><strong id="usageRewriteWords">500</strong><span>words per rewrite</span></div>
+        </div>
+        <p class="hint">Daily limits reset at midnight (CAT). Requests that fail don't count.</p>
+        <div class="editor-actions">
+          <button class="btn-ghost compact" id="signOutBtn" type="button">Sign out</button>
+        </div>
+        <details class="account-more">
+          <summary>Change password</summary>
+          <label class="field-label" for="currentPassword">Current password</label>
+          <input id="currentPassword" type="password" autocomplete="current-password">
+          <label class="field-label" for="newPassword">New password</label>
+          <input id="newPassword" type="password" autocomplete="new-password">
+          <div class="editor-actions">
+            <button class="btn-ghost compact" id="changePasswordBtn" type="button">Change password</button>
+          </div>
+          <p class="key-feedback" id="passwordFeedback" role="status" hidden></p>
+        </details>
+        <details class="account-more">
+          <summary>Delete account</summary>
+          <p class="hint">This removes your account and usage history. It can't be undone.</p>
+          <label class="field-label" for="deletePassword">Password</label>
+          <input id="deletePassword" type="password" autocomplete="current-password">
+          <div class="editor-actions">
+            <button class="btn-ghost danger compact" id="deleteAccountBtn" type="button">Delete my account</button>
+          </div>
+          <p class="key-feedback" id="deleteFeedback" role="status" hidden></p>
+        </details>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="plansTitle">
+        <h2 id="plansTitle">Plans</h2>
+        <div class="plan-grid">
+          <div class="plan-col">
+            <strong>Free</strong>
+            <ul><li>500 words per request</li><li>5 rewrites a day</li><li>Natural and Academic tones</li></ul>
+          </div>
+          <div class="plan-col">
+            <strong>Premium</strong>
+            <ul><li>2,500 words per request</li><li>15 rewrites a day</li><li>All 6 tones, no ads</li></ul>
+          </div>
+          <div class="plan-col">
+            <strong>Family</strong>
+            <ul><li>Premium for up to 5 people</li><li>15 rewrites a day each</li><li>One bill for the group</li></ul>
+          </div>
+        </div>
+        <p class="hint">Online payment is coming soon. Until then, upgrades are arranged with the Glitch//Detect team.</p>
       </section>
 
       <section class="panel settings-card">

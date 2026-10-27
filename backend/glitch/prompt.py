@@ -94,13 +94,15 @@ def build_compact_messages(sentences: list[str], index: int, total: int) -> list
 # (§4.4.3). So passages are rewritten as units with freedom to restructure,
 # and each comes with specific notes from glitch/style.py.
 # ---------------------------------------------------------------------------
-HUMANIZE_VERSION = 3
+HUMANIZE_VERSION = 4
 
 TONES = {
     "natural": "natural and clear, like a thoughtful person writing for a reader they respect",
     "casual": "relaxed and conversational; contractions and the odd fragment are fine",
     "academic": "precise academic prose that still sounds like one person thinking, not a template",
     "professional": "direct and plain, like a capable colleague's email or report",
+    "persuasive": "convincing and concrete, building to a clear point or call to action without hype",
+    "simple": "plain English: short, common words and short sentences that anyone can follow",
 }
 
 # Measured on live detectors: clean vocabulary alone leaves a generic passage at
@@ -131,26 +133,41 @@ Change the shape, not just the words:
 - Avoid: delve, crucial, pivotal, vital, foster, leverage, robust, seamless, holistic, transformative, unprecedented, landscape, realm, tapestry, testament, navigate, stakeholders, streamline, unlock, empower, multifaceted, showcase, underscore.
 - Hedge only where something is genuinely uncertain. Use at most one dash per passage.
 
-Never invent facts, names, numbers, quotes, examples, or personal experiences. Keep every fact, name and number that is there. Keep the meaning and the writer's point of view.
+Never invent facts, names, numbers, quotes, examples, or personal experiences, and don't name products, tools, companies, people or places that aren't in the passage. Keep every fact, name and number that is there, spelled the same way. Keep the meaning and the writer's point of view.
 
 Voice: {voice}
 Tone: {tone}.
 
-Each passage to rewrite is marked [n]; follow its [n notes] if present. Lines marked [context] are neighbouring text for reference only: never rewrite or repeat them.
-Reply with raw JSON only, no markdown or commentary: {{"rewrites":{{"<n>":"<rewritten passage>"}}}} with one entry for every passage number."""
+Each passage to rewrite is marked [n]; follow its [n notes] if present. [n facts] are details the author supplied: use them where they fit, in your own wording; they are the only new material allowed. Lines marked [context] are neighbouring text for reference only: never rewrite or repeat them.
+{reply}"""
+
+_REPLY_ONE = (
+    'Reply with raw JSON only, no markdown or commentary: {"rewrites":{"<n>":"<rewritten passage>"}} '
+    "with one entry for every passage number."
+)
+# Best-of-2 (Phase 3): two versions built on different plans, in one request,
+# so the input is paid once; the app picks the better one locally.
+_REPLY_TWO = (
+    "Write TWO different versions of every passage. Version A leads with the most concrete point; "
+    "version B leads with the conclusion, then the reason. Give them different sentence counts.\n"
+    'Reply with raw JSON only, no markdown or commentary: {"rewrites":{"<n>":["<version A>","<version B>"]}} '
+    "with one entry for every passage number."
+)
 
 
 def build_humanize_messages(
-    items: list[tuple[str, str]], tone: str, voice: str = "personal"
+    items: list[tuple[str, str]], tone: str, voice: str = "personal", variants: int = 1
 ) -> list[dict]:
-    """``items`` are (tag, text) in document order; tag is "context", "<n>" or "<n> notes"."""
+    """``items`` are (tag, text) in document order; tag is "context", "<n>", "<n> notes" or "<n> facts"."""
     lines = [f"[{tag}] {text}" for tag, text in items]
     passages = sum(1 for tag, _ in items if tag.isdigit())
     return [
         {
             "role": "system",
             "content": _HUMANIZE_SYSTEM.format(
-                tone=TONES.get(tone, TONES["natural"]), voice=VOICES.get(voice, VOICES["personal"])
+                tone=TONES.get(tone, TONES["natural"]),
+                voice=VOICES.get(voice, VOICES["personal"]),
+                reply=_REPLY_TWO if variants > 1 else _REPLY_ONE,
             ),
         },
         {

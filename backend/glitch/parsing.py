@@ -291,8 +291,12 @@ def parse_analysis(raw: str) -> tuple[list[Sentence], list[str]]:
 _REWRITE_PAIR_RE = re.compile(r'"(\d+)"\s*:\s*"((?:\\.|[^"\\])*)"', re.DOTALL)
 
 
-def parse_rewrites(raw: str, expected: list[int]) -> tuple[dict[int, str], list[str]]:
-    """Parse ``{"rewrites": {"3": "..."}}`` (or close variants) into {number: text}."""
+def parse_rewrites(raw: str, expected: list[int], variants: int = 1) -> tuple[dict, list[str]]:
+    """Parse ``{"rewrites": {"3": "..."}}`` (or close variants) into {number: text}.
+
+    With ``variants`` > 1 the model sends ``{"3": ["A", "B"]}`` and the result
+    maps each number to a list of versions (a single string still counts).
+    """
     if not raw or not raw.strip():
         raise ParseError("The model returned an empty response.")
     candidate = extract_outermost_json(strip_code_fences(raw))
@@ -304,12 +308,12 @@ def parse_rewrites(raw: str, expected: list[int]) -> tuple[dict[int, str], list[
         except Exception:
             continue
 
-    found: dict[int, str] = {}
+    found: dict[int, str | list] = {}
     if isinstance(payload, dict):
         inner = payload.get("rewrites", payload)
         if isinstance(inner, dict):
             for k, v in inner.items():
-                if str(k).strip().isdigit() and isinstance(v, str):
+                if str(k).strip().isdigit() and (isinstance(v, str) or isinstance(v, list)):
                     found[int(k)] = v
         elif isinstance(inner, list):
             payload = inner
@@ -325,8 +329,13 @@ def parse_rewrites(raw: str, expected: list[int]) -> tuple[dict[int, str], list[
         found = {int(n): _json_unescape(t) for n, t in _REWRITE_PAIR_RE.findall(candidate)}
 
     wanted = set(expected)
-    rewrites = {n: WS_RE.sub(" ", t).strip() for n, t in found.items() if n in wanted}
-    rewrites = {n: t for n, t in rewrites.items() if t}
+    versions: dict[int, list[str]] = {}
+    for n, value in found.items():
+        texts = value if isinstance(value, list) else [value]
+        texts = [WS_RE.sub(" ", t).strip() for t in texts if isinstance(t, str)]
+        if n in wanted and any(texts):
+            versions[n] = [t for t in texts if t][: max(1, variants)]
+    rewrites = versions if variants > 1 else {n: v[0] for n, v in versions.items()}
     if not rewrites:
         snippet = WS_RE.sub(" ", raw)[:280]
         raise ParseError(

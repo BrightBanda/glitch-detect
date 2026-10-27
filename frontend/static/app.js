@@ -8,7 +8,10 @@
   // Defaults until /api/config answers (see loadConfig).
   let MIN_CHARS = 80;
   let MAX_WORDS = 2500;
+  let MAX_REWRITE_WORDS = 1500;
+  let PREMIUM_REWRITE_WORDS = 1500;
   let DEFAULT_MODEL = "";
+  let TONE_LABELS = {};
   const VIEWS = ["check", "humanize", "settings", "account"];
 
   const els = {
@@ -47,6 +50,10 @@
     humanizePanel: $("humanizePanel"),
     humanizeInput: $("humanizeInput"),
     humanizeStats: $("humanizeStats"),
+    askQuestions: $("askQuestions"),
+    questionList: $("questionList"),
+    questionsEmpty: $("questionsEmpty"),
+    downloadTrail: $("downloadTrail"),
     humanizeLimitNote: $("humanizeLimitNote"),
     useLastCheck: $("useLastCheck"),
     humanizeTone: $("humanizeTone"),
@@ -96,6 +103,37 @@
     statWords: $("statWords"),
     statLast: $("statLast"),
     clearData: $("clearData"),
+    nameHint: $("nameHint"),
+    accountSub: $("accountSub"),
+    authCard: $("authCard"),
+    authTitle: $("authTitle"),
+    authTabs: Array.from(document.querySelectorAll("[data-auth]")),
+    authEmail: $("authEmail"),
+    authNameRow: $("authNameRow"),
+    authName: $("authName"),
+    authPassword: $("authPassword"),
+    authHint: $("authHint"),
+    authSubmit: $("authSubmit"),
+    authFeedback: $("authFeedback"),
+    planCard: $("planCard"),
+    planBadge: $("planBadge"),
+    planLine: $("planLine"),
+    usageChecks: $("usageChecks"),
+    usageChecksLabel: $("usageChecksLabel"),
+    usageRewrites: $("usageRewrites"),
+    usageRewritesLabel: $("usageRewritesLabel"),
+    usageWords: $("usageWords"),
+    usageRewriteWords: $("usageRewriteWords"),
+    signOutBtn: $("signOutBtn"),
+    currentPassword: $("currentPassword"),
+    newPassword: $("newPassword"),
+    changePasswordBtn: $("changePasswordBtn"),
+    passwordFeedback: $("passwordFeedback"),
+    deletePassword: $("deletePassword"),
+    deleteAccountBtn: $("deleteAccountBtn"),
+    deleteFeedback: $("deleteFeedback"),
+    rewriteNudge: $("rewriteNudge"),
+    rewritesLeft: $("rewritesLeft"),
   };
 
   const DEFAULT_SETTINGS = {
@@ -123,6 +161,9 @@
     busy: false,
     keyTimer: null,
     modelsRequest: 0,
+    me: null, // /api/me: { user | null, plan, usage }
+    authMode: "signup",
+    nameTimer: null,
   };
 
   const SAMPLE = `In today's rapidly evolving digital landscape, artificial intelligence plays a crucial role in shaping the future of human communication. By leveraging advanced algorithms, organizations can foster innovation, streamline workflows, and unlock unprecedented levels of efficiency. Moreover, these systems demonstrate a strong commitment to adaptability in an increasingly complex world.
@@ -481,14 +522,19 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
       if (active) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
-    if (view === "account") renderProfile();
+    if (view === "account") {
+      renderProfile();
+      loadMe(); // plan or usage may have changed elsewhere (e.g. an admin grant)
+    }
     if (view === "humanize") els.useLastCheck.hidden = !state.lastCheck;
     window.scrollTo(0, 0);
   }
 
   /* ─────────────────────────── account view ─────────────────────────── */
   function renderProfile() {
-    const { name, scans, words, last } = state.profile;
+    const { scans, words, last } = state.profile;
+    const account = state.me && state.me.user;
+    const name = account ? account.name || "" : state.profile.name;
     els.displayName.value = name;
     els.avatar.textContent = name ? name.trim()[0].toUpperCase() : "?";
     els.statScans.textContent = scans.toLocaleString();
@@ -502,7 +548,11 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     box.dataset.tone = tone;
     box.querySelector(".alert-title").textContent = title;
     box.querySelector(".alert-message").textContent = message;
-    box.querySelector(".alert-action").hidden = !action;
+    // `action`: true → Settings link, or { href, text } for another page.
+    const link = box.querySelector(".alert-action");
+    link.hidden = !action;
+    link.href = (action && action.href) || "#settings";
+    link.textContent = (action && action.text) || "Open settings →";
     box.querySelector(".alert-detail").textContent = detail;
     box.querySelector(".alert-detail-wrap").hidden = !detail;
     box.hidden = false;
@@ -510,8 +560,22 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
   const hideAlert = (box) => (box.hidden = true);
 
   /** Plain-language explanation for a failed request. */
+  const ACCOUNT_LINK = { href: "#account", text: "Go to your account →" };
+
   function explainError(status, error, verb = "check") {
     const detail = [error.message, error.detail].filter(Boolean).join("\n");
+    const byCode = {
+      auth_required: ["Rewriting needs a free account", ACCOUNT_LINK],
+      quota: ["You've reached today's limit", ACCOUNT_LINK],
+      plan_words: ["Too long for your plan", ACCOUNT_LINK],
+      plan_tone: ["That tone is part of Premium", ACCOUNT_LINK],
+      suspended: ["This account is suspended", false],
+    };
+    if (byCode[error.code]) {
+      const [title, action] = byCode[error.code];
+      if (error.code === "auth_required" || error.code === "suspended") loadMe();
+      return { title, message: error.message, action, detail: "", tone: "info" };
+    }
     const friendly = {
       401: ["That API key didn't work", "Check the key in Settings, or remove it to use the built-in one.", true],
       402: ["The AI service declined the request", "The account behind this key may be out of credits.", true],
@@ -539,28 +603,245 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
   }
 
   /* ─────────────────────────── word limits ─────────────────────────── */
-  function showWordCount(words, stats, note) {
-    stats.textContent = `${words.toLocaleString()} / ${MAX_WORDS.toLocaleString()} words`;
-    stats.dataset.state = words > MAX_WORDS ? "over" : words > MAX_WORDS * 0.9 ? "near" : "ok";
-    const over = words - MAX_WORDS;
+  /** Checks and rewrites have separate caps (a rewrite costs far more). */
+  const limitFor = (kind) => (kind === "rewrite" ? MAX_REWRITE_WORDS : MAX_WORDS);
+
+  function showWordCount(words, stats, note, kind = "check") {
+    const limit = limitFor(kind);
+    stats.textContent = `${words.toLocaleString()} / ${limit.toLocaleString()} words`;
+    stats.dataset.state = words > limit ? "over" : words > limit * 0.9 ? "near" : "ok";
+    const over = words - limit;
     note.hidden = over <= 0;
     if (over > 0) {
       note.textContent =
-        `That's ${words.toLocaleString()} words, which is over the ${MAX_WORDS.toLocaleString()}-word limit. ` +
-        `Please remove about ${plural(over, "word")}, or work on it in parts.`;
+        `That's ${words.toLocaleString()} words, which is over the ${limit.toLocaleString()}-word ${kind} limit${planSuffix()}. ` +
+        `Please remove about ${plural(over, "word")}, or work on it in parts.${upgradeHint(kind)}`;
     }
   }
 
-  function overLimit(text, box) {
+  function overLimit(text, box, kind = "check") {
     const words = countWords(text);
-    if (words <= MAX_WORDS) return false;
+    const limit = limitFor(kind);
+    if (words <= limit) return false;
+    const hint = upgradeHint(kind);
     showAlert(
       box,
       "This text is too long",
-      `The limit is ${MAX_WORDS.toLocaleString()} words for now. This one has ${words.toLocaleString()}. Please shorten it or work on it in parts.`,
-      { tone: "info" }
+      `You can ${kind} up to ${limit.toLocaleString()} words at a time${planSuffix()}. This one has ${words.toLocaleString()}. Please shorten it or work on it in parts.${hint}`,
+      { tone: "info", action: hint ? ACCOUNT_LINK : false }
     );
     return true;
+  }
+
+  /* ─────────────────────────── account & plan ─────────────────────────── */
+  const signedIn = () => Boolean(state.me && state.me.user);
+  const planOf = () => (state.me && state.me.plan) || null;
+
+  function planSuffix() {
+    const plan = planOf();
+    if (!plan) return "";
+    return plan.id === "guest" ? " for guests" : ` on the ${plan.label} plan`;
+  }
+
+  function upgradeHint(kind = "check") {
+    const plan = planOf();
+    const premium = kind === "rewrite" ? PREMIUM_REWRITE_WORDS : 2500;
+    if (!plan || limitFor(kind) >= premium) return "";
+    const amount = premium.toLocaleString();
+    return plan.id === "guest" ? ` A free account doesn't raise this; Premium allows ${amount}.` : ` Premium allows ${amount}.`;
+  }
+
+  async function loadMe() {
+    try {
+      const res = await fetch("/api/me", { cache: "no-store" });
+      const data = await res.json();
+      if (data && data.ok) state.me = data;
+    } catch {
+      /* offline: keep what we had */
+    }
+    applyPlan();
+    renderAccount();
+  }
+
+  /** Limits from the plan: word cap, allowed tones, rewrite nudges. */
+  function applyPlan() {
+    const plan = planOf();
+    if (plan && plan.max_words) MAX_WORDS = plan.max_words;
+    if (plan && plan.rewrite_words) MAX_REWRITE_WORDS = plan.rewrite_words;
+    els.humanizeInput.dispatchEvent(new Event("input"));
+    els.text.placeholder = `Paste an essay, article, email… anything with at least a few sentences (up to ${MAX_WORDS.toLocaleString()} words).`;
+    const allowed = new Set((plan && plan.tones) || []);
+    Array.from(els.humanizeTone.options).forEach((option) => {
+      const label = TONE_LABELS[option.value] || option.value;
+      const locked = plan && plan.id !== "guest" && !allowed.has(option.value);
+      option.disabled = Boolean(locked);
+      option.textContent = locked ? `${label} · Premium` : label;
+    });
+    if (els.humanizeTone.selectedOptions[0] && els.humanizeTone.selectedOptions[0].disabled) {
+      els.humanizeTone.value = (plan && plan.tones && plan.tones[0]) || "natural";
+    }
+    els.rewriteNudge.hidden = signedIn();
+    if (signedIn()) {
+      const used = state.me.usage.rewrites || 0;
+      const left = Math.max(0, plan.rewrites_per_day - used);
+      els.rewritesLeft.hidden = false;
+      els.rewritesLeft.textContent = `${left} of ${plan.rewrites_per_day} rewrites left today`;
+      els.rewritesLeft.dataset.state = left ? "ok" : "out";
+    } else {
+      els.rewritesLeft.hidden = true;
+    }
+    updateStats();
+    updateHumanizeStats();
+  }
+
+  function renderAccount() {
+    const me = state.me;
+    const user = me && me.user;
+    els.authCard.hidden = Boolean(user);
+    els.planCard.hidden = !user;
+    els.accountSub.textContent = user
+      ? `Signed in as ${user.email}.`
+      : "Checking works without an account. A free account adds rewrites.";
+    els.nameHint.textContent = user ? "Saved to your account." : "Only used to greet you. Saved on this device.";
+    if (user) {
+      const plan = me.plan;
+      const usage = me.usage || {};
+      els.planBadge.textContent = plan.label;
+      els.planBadge.dataset.plan = plan.id;
+      const ends = user.period_end
+        ? new Date(user.period_end * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })
+        : "";
+      const lines = {
+        free: "Free plan. Upgrade for longer texts, more rewrites and every tone.",
+        grace: `Your plan ended on ${ends}. You keep it for 48 hours while you renew.`,
+        cancelled: `Cancelled. Your plan stays active until ${ends}.`,
+        expired: "Your paid plan has ended, so you're on Free limits.",
+        pending_payment: "Payment pending. You'll get your plan as soon as it's confirmed.",
+      };
+      els.planLine.textContent =
+        user.status === "active" ? (ends ? `Active until ${ends}.` : "Active.") : lines[user.status] || "";
+      els.usageChecks.textContent = `${usage.checks || 0}/${plan.checks_per_day}`;
+      els.usageRewrites.textContent = `${usage.rewrites || 0}/${plan.rewrites_per_day}`;
+      els.usageWords.textContent = plan.max_words.toLocaleString();
+      els.usageRewriteWords.textContent = plan.rewrite_words.toLocaleString();
+    }
+    renderProfile();
+  }
+
+  function setAuthMode(mode) {
+    state.authMode = mode;
+    els.authTabs.forEach((tab) => {
+      const active = tab.dataset.auth === mode;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    const signup = mode === "signup";
+    els.authTitle.textContent = signup ? "Create a free account" : "Sign in";
+    els.authNameRow.hidden = !signup;
+    els.authPassword.autocomplete = signup ? "new-password" : "current-password";
+    els.authHint.hidden = !signup;
+    els.authSubmit.querySelector(".btn-label").textContent = signup ? "CREATE ACCOUNT" : "SIGN IN";
+    setFeedback(els.authFeedback, "");
+  }
+
+  function setFeedback(element, message, tone = "info") {
+    element.textContent = message || "";
+    element.dataset.state = tone;
+    element.hidden = !message;
+  }
+
+  async function submitAuth() {
+    if (state.busy) return;
+    const signup = state.authMode === "signup";
+    const body = { email: els.authEmail.value.trim(), password: els.authPassword.value };
+    if (signup) body.name = els.authName.value.trim() || state.profile.name || "";
+    if (!body.email || !body.password) {
+      setFeedback(els.authFeedback, "Enter your email and password.", "error");
+      return;
+    }
+    const stop = startBusy(els.authSubmit, els.authCard);
+    try {
+      const { res, data } = await postJson(signup ? "/api/auth/signup" : "/api/auth/login", body, { timeout: 30000 });
+      if (!res.ok || !data || !data.ok) {
+        setFeedback(els.authFeedback, (data && data.error && data.error.message) || "That didn't work. Try again.", "error");
+        return;
+      }
+      state.me = data;
+      els.authPassword.value = "";
+      applyPlan();
+      renderAccount();
+      setFeedback(els.authFeedback, "");
+    } catch {
+      setFeedback(els.authFeedback, "Couldn't reach the app.", "error");
+    } finally {
+      stop();
+    }
+  }
+
+  async function accountPost(url, body, feedback) {
+    try {
+      const { res, data } = await postJson(url, body, { timeout: 30000 });
+      if (!res.ok || !data || !data.ok) {
+        setFeedback(feedback, (data && data.error && data.error.message) || "That didn't work. Try again.", "error");
+        return null;
+      }
+      return data;
+    } catch {
+      setFeedback(feedback, "Couldn't reach the app.", "error");
+      return null;
+    }
+  }
+
+  async function signOutAccount() {
+    const data = await accountPost("/api/auth/logout", {}, els.authFeedback);
+    if (data) state.me = data;
+    applyPlan();
+    renderAccount();
+    setAuthMode("login");
+  }
+
+  async function changePassword() {
+    const data = await accountPost(
+      "/api/me/password",
+      { current: els.currentPassword.value, new: els.newPassword.value },
+      els.passwordFeedback
+    );
+    if (!data) return;
+    els.currentPassword.value = "";
+    els.newPassword.value = "";
+    setFeedback(els.passwordFeedback, "✓ Password changed. Other devices were signed out.", "ok");
+  }
+
+  async function deleteAccount() {
+    if (!window.confirm("Delete your account and its usage history? This can't be undone.")) return;
+    const data = await accountPost("/api/me/delete", { password: els.deletePassword.value }, els.deleteFeedback);
+    if (!data) return;
+    els.deletePassword.value = "";
+    state.me = data;
+    applyPlan();
+    renderAccount();
+    setAuthMode("signup");
+    setFeedback(els.authFeedback, "Your account was deleted.", "ok");
+  }
+
+  function saveAccountName() {
+    clearTimeout(state.nameTimer);
+    state.nameTimer = setTimeout(async () => {
+      try {
+        const res = await fetch("/api/me", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: els.displayName.value.trim() }),
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          state.me = data;
+          renderProfile();
+        }
+      } catch {
+        /* name stays local until the next successful save */
+      }
+    }, 600);
   }
 
   /* ─────────────────────────── busy state ─────────────────────────── */
@@ -686,10 +967,11 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
       const { res, data } = await postJson("/api/analyze", { text, ...routingOptions() });
       if (!res.ok || !data || !data.ok) {
         const e = explainError(res.status, (data && data.error) || {});
-        showAlert(els.alert, e.title, e.message, { action: e.action, detail: e.detail });
+        showAlert(els.alert, e.title, e.message, { action: e.action, detail: e.detail, tone: e.tone });
         return;
       }
       render(data.result, text);
+      loadMe();
     } catch (err) {
       if (err.name === "AbortError") showAlert(els.alert, "This is taking too long", "Try again, or check a shorter piece of text.");
       else showAlert(els.alert, "Can't reach the app", "Glitch//Detect seems to have stopped running on this computer. Restart it and try again.");
@@ -727,7 +1009,7 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
 
   /* ─────────────────────────── humanize ─────────────────────────── */
   function updateHumanizeStats() {
-    showWordCount(countWords(els.humanizeInput.value), els.humanizeStats, els.humanizeLimitNote);
+    showWordCount(countWords(els.humanizeInput.value), els.humanizeStats, els.humanizeLimitNote, "rewrite");
   }
 
   function useLastCheck() {
@@ -756,6 +1038,9 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
       if (result.rewritten < result.targets) note += " The rest were left as they were.";
     }
     if (result.fallbacks && result.fallbacks.length) note += " The AI service was busy, so a backup model helped.";
+    const facts = (result.changes || []).filter((c) => c.facts).length;
+    if (facts) note += ` Used your details in ${plural(facts, "passage")}.`;
+    (result.notes || []).forEach((extra) => (note += ` ${extra}`));
     els.rewriteNote.textContent = note;
 
     const st = result.style || {};
@@ -784,11 +1069,108 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     els.humanizeResult.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
+  /* Optional details from the writer (the only new facts a rewrite may use). */
+  async function askQuestions() {
+    const text = els.humanizeInput.value.trim();
+    hideAlert(els.hAlert);
+    if (text.length < MIN_CHARS) {
+      showAlert(els.hAlert, "A little more text, please", "Paste your draft first, then we'll suggest questions.", { tone: "info" });
+      return;
+    }
+    const labels = state.lastCheck && state.lastCheck.text === text ? state.lastCheck.sentences : undefined;
+    try {
+      const { res, data } = await postJson("/api/humanize/questions", { text, labels });
+      if (!res.ok || !data || !data.ok) {
+        const e = explainError(res.status, (data && data.error) || {}, "rewrite");
+        showAlert(els.hAlert, e.title, e.message, { tone: e.tone });
+        return;
+      }
+      renderQuestions(data.paragraphs || []);
+    } catch {
+      showAlert(els.hAlert, "Can't reach the app", "Glitch//Detect seems to have stopped running on this computer. Restart it and try again.");
+    }
+  }
+
+  function renderQuestions(paragraphs) {
+    const kept = collectFacts();
+    els.questionsEmpty.hidden = paragraphs.length > 0;
+    els.questionList.replaceChildren(
+      ...paragraphs.map((para, index) => {
+        const block = document.createElement("div");
+        block.className = "question-block";
+        const opening = document.createElement("p");
+        opening.className = "question-opening";
+        opening.textContent = `“${para.opening}…”`;
+        const list = document.createElement("ul");
+        para.questions.forEach((q) => {
+          const li = document.createElement("li");
+          li.textContent = q;
+          list.appendChild(li);
+        });
+        const answer = document.createElement("textarea");
+        answer.className = "question-answer";
+        answer.rows = 2;
+        answer.maxLength = 600;
+        answer.dataset.key = para.key;
+        answer.id = `fact-${index}`;
+        answer.placeholder = "Your answer (leave blank to skip)";
+        answer.setAttribute("aria-label", `Details for the paragraph starting ${para.opening}`);
+        answer.value = kept[para.key] || "";
+        block.append(opening, list, answer);
+        return block;
+      })
+    );
+  }
+
+  function collectFacts() {
+    const facts = {};
+    els.questionList.querySelectorAll("textarea[data-key]").forEach((box) => {
+      if (box.value.trim()) facts[box.dataset.key] = box.value.trim();
+    });
+    return facts;
+  }
+
+  /** A plain-text record of authorship: original, rewritten, and author-supplied details. */
+  function downloadTrail() {
+    const r = state.rewrite;
+    if (!r) return;
+    const models = (r.models_used || []).map((m) => m.model).join(", ") || "unknown";
+    const lines = [
+      "GLITCH//DETECT AUTHORSHIP RECORD",
+      new Date().toLocaleString(),
+      `Tone: ${r.tone}   Voice: ${r.voice}   Model(s): ${models}`,
+      "",
+      `${plural(r.passages, "passage")} rewritten by an AI model. Everything else is the writer's own text as submitted.`,
+      "",
+    ];
+    (r.changes || []).forEach((change, i) => {
+      lines.push(`── Passage ${i + 1} ──`, "WRITTEN BY THE AUTHOR (before):", change.before, "");
+      if (change.facts) lines.push("DETAILS SUPPLIED BY THE AUTHOR:", change.facts, "");
+      lines.push("REWRITTEN BY AI (after):", change.after, "");
+    });
+    lines.push("── Final text ──", r.text);
+    const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `glitch-authorship-${new Date().toISOString().slice(0, 10)}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
   async function runHumanize({ fresh = false } = {}) {
     if (state.busy) return;
     const text = els.humanizeInput.value.trim();
     hideAlert(els.hAlert);
-    if (needsSetup(els.hAlert) || overLimit(text, els.hAlert)) return;
+    if (needsSetup(els.hAlert) || overLimit(text, els.hAlert, "rewrite")) return;
+    if (!signedIn()) {
+      showAlert(els.hAlert, "Rewriting needs a free account", "Create a free account or sign in. Free accounts get 5 rewrites a day.", {
+        tone: "info",
+        action: { href: "#account", text: "Create an account →" },
+      });
+      return;
+    }
     if (text.length < MIN_CHARS) {
       showAlert(els.hAlert, "A little more text, please", "Paste at least a couple of full sentences to rewrite.", { tone: "info" });
       els.humanizeInput.focus();
@@ -807,14 +1189,16 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
         only_flagged: els.onlyFlagged.checked,
         second_pass: els.secondPass.checked,
         labels,
+        facts: collectFacts(),
         ...routingOptions(),
       });
       if (!res.ok || !data || !data.ok) {
         const e = explainError(res.status, (data && data.error) || {}, "rewrite");
-        showAlert(els.hAlert, e.title, e.message, { action: e.action, detail: e.detail });
+        showAlert(els.hAlert, e.title, e.message, { action: e.action, detail: e.detail, tone: e.tone });
         return;
       }
       renderRewrite(data.result);
+      loadMe();
     } catch (err) {
       if (err.name === "AbortError") showAlert(els.hAlert, "This is taking too long", "Try again, or rewrite a shorter piece of text.");
       else showAlert(els.hAlert, "Can't reach the app", "Glitch//Detect seems to have stopped running on this computer. Restart it and try again.");
@@ -892,6 +1276,8 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     saveSettings();
   });
   els.copyRewrite.addEventListener("click", copyRewrite);
+  els.downloadTrail.addEventListener("click", downloadTrail);
+  els.askQuestions.addEventListener("click", askQuestions);
   els.checkRewrite.addEventListener("click", () => {
     if (!state.rewrite) return;
     els.text.value = state.rewrite.text;
@@ -922,10 +1308,27 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
   });
 
   els.displayName.addEventListener("input", () => {
+    if (signedIn()) {
+      saveAccountName();
+      return;
+    }
     state.profile.name = els.displayName.value.trim();
     saveProfile();
     renderProfile();
   });
+  els.authTabs.forEach((tab) => tab.addEventListener("click", () => setAuthMode(tab.dataset.auth)));
+  els.authSubmit.addEventListener("click", submitAuth);
+  [els.authEmail, els.authPassword, els.authName].forEach((input) =>
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submitAuth();
+      }
+    })
+  );
+  els.signOutBtn.addEventListener("click", signOutAccount);
+  els.changePasswordBtn.addEventListener("click", changePassword);
+  els.deleteAccountBtn.addEventListener("click", deleteAccount);
   els.clearData.addEventListener("click", () => {
     if (!window.confirm("Clear your name, activity, keys and settings from this device?")) return;
     for (const area of ["localStorage", "sessionStorage"]) {
@@ -948,7 +1351,9 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
       const cfg = await res.json();
       MIN_CHARS = cfg.min_chars || MIN_CHARS;
       MAX_WORDS = cfg.max_words || MAX_WORDS;
+      PREMIUM_REWRITE_WORDS = cfg.max_rewrite_words || PREMIUM_REWRITE_WORDS;
       DEFAULT_MODEL = cfg.default_model || "";
+      TONE_LABELS = cfg.tone_labels || {};
       if (!store.get("localStorage", "glitch_settings") && cfg.default_provider) {
         state.settings.provider = cfg.default_provider;
       }
@@ -959,7 +1364,7 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
           ...cfg.tones.map((tone) => {
             const option = document.createElement("option");
             option.value = tone;
-            option.textContent = tone.charAt(0).toUpperCase() + tone.slice(1);
+            option.textContent = TONE_LABELS[tone] || tone.charAt(0).toUpperCase() + tone.slice(1);
             return option;
           })
         );
@@ -975,8 +1380,7 @@ Ultimately, the integration of intelligent systems serves as a testament to the 
     showView(location.hash.slice(1));
     await loadConfig();
     fillSettings();
-    updateStats();
-    updateHumanizeStats();
+    await loadMe();
     loadProviders();
   })();
 })();
